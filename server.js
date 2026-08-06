@@ -33,6 +33,7 @@ const {
 
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false });
 const app = express();
+app.set('trust proxy', true);
 app.use(cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN.split(','), credentials: false }));
 app.use(express.json({ limit: '2mb' }));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -220,7 +221,9 @@ app.get('/api/admin/bitacora', auth(['admin']), async (_req, res) => {
    GOOGLE: autorización única del titular + clientes Drive/Sheets
    ============================================================ */
 function oauthClient(req) {
-  const base = `${req.protocol}://${req.get('host')}`;
+  // Railway sirve siempre por https detrás de un proxy; forzamos el esquema para que
+  // el redirect_uri declarado a Google coincida exactamente con el registrado.
+  const base = `https://${req.get('host')}`;
   return new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, `${base}/oauth/google/callback`);
 }
 async function googleAuth() {
