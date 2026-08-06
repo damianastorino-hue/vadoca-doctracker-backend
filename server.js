@@ -461,6 +461,39 @@ app.post('/api/migrar', auth(['admin']), async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* ---------- Recuperación de bitácoras v1 (historial.json en Drive) ---------- */
+app.post('/api/importar-historiales', auth(['admin']), async (req, res) => {
+  try {
+    const exps = (await pool.query(`SELECT DISTINCT expediente_id, historial_file_id FROM documentos
+                                    WHERE historial_file_id IS NOT NULL AND historial_file_id <> ''`)).rows;
+    const drive = await driveCli();
+    let importadas = 0, saltados = 0; const errores = [];
+    for (const e of exps) {
+      // idempotente: si el expediente ya tiene bitácora en la base, no se toca
+      const ya = await pool.query('SELECT 1 FROM bitacora WHERE expediente_id=$1 LIMIT 1', [e.expediente_id]);
+      if (ya.rowCount) { saltados++; continue; }
+      try {
+        const f = await drive.files.get({ fileId: e.historial_file_id, alt: 'media' });
+        const data = typeof f.data === 'object' ? f.data : JSON.parse(f.data);
+        for (const n of (data.entradas || [])) {
+          const prev = await ultimoHash('bitacora', 'WHERE expediente_id=$1', [e.expediente_id]);
+          const ts = n.ts || ahora();
+          const autor = n.autor || 'v1';
+          const tipo = n.tipo || 'nota';
+          const texto = n.texto || '';
+          const adjuntos = n.adjuntos || [];
+          const h = sha(prev + '|' + new Date(ts).toISOString() + '|' + autor + '|' + tipo + '|' + texto + '|' + JSON.stringify(adjuntos));
+          await pool.query('INSERT INTO bitacora(expediente_id,ts,autor,tipo,texto,adjuntos,prev_hash,hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',
+            [e.expediente_id, ts, autor, tipo, texto, JSON.stringify(adjuntos), prev, h]);
+          importadas++;
+        }
+      } catch (err) { errores.push(e.expediente_id + ': ' + err.message); }
+    }
+    await logAdmin(req.user.email, 'importacion_historiales_v1', `${importadas} entradas recuperadas; ${saltados} expedientes ya tenían bitácora`);
+    res.json({ ok: true, entradas: importadas, expedientes: exps.length, saltados, errores });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ---------- Salud y arranque ---------- */
 app.get('/', (_req, res) => res.send('VADOCA DocTracker backend v2.0 — OK'));
 app.get('/api/salud', async (_req, res) => {
