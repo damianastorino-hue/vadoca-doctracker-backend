@@ -1,0 +1,9 @@
+# Copiar estos nombres como Variables en Railway (no hace falta este archivo en producción)
+DATABASE_URL=        # Railway la inyecta sola al vincular Postgres
+JWT_SECRET=          # una frase larga y aleatoria, ej: salida de https://www.uuidgenerator.net
+ADMIN_EMAIL=damian.astorino@vadoca.com.ar
+ADMIN_PASSWORD=      # clave inicial del superusuario (te la pide cambiar al primer ingreso)
+GOOGLE_CLIENT_ID=    # el mismo de la app actual (....apps.googleusercontent.com)
+GOOGLE_CLIENT_SECRET=# Credenciales -> tu Client ID -> "Secreto del cliente"
+SHEET_ID=1e8d_Leo2RWYvGf6frTVUOdTX5t2fnAcCqx8_kzvZ-PU
+FRONTEND_ORIGIN=https://damianastorino-hue.github.io
