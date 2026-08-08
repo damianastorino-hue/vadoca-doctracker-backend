@@ -90,6 +90,21 @@ CREATE TABLE IF NOT EXISTS bitacora (
   hash TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_bit_exp ON bitacora(expediente_id);
+CREATE TABLE IF NOT EXISTS procedimientos (
+  id SERIAL PRIMARY KEY,
+  codigo TEXT UNIQUE NOT NULL,
+  codigo_base TEXT NOT NULL,
+  titulo TEXT NOT NULL,
+  version TEXT NOT NULL DEFAULT '01',
+  estado TEXT NOT NULL DEFAULT 'Borrador',
+  vigencia_meses INT NOT NULL DEFAULT 36,
+  fecha_vigencia TEXT, fecha_vencimiento TEXT,
+  carpeta_drive_id TEXT, carpeta_drive_url TEXT,
+  autor TEXT NOT NULL,
+  ultimo_movimiento TIMESTAMPTZ,
+  creado TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_proc_base ON procedimientos(codigo_base);
 CREATE TABLE IF NOT EXISTS admin_log (
   id SERIAL PRIMARY KEY,
   ts TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -288,7 +303,8 @@ async function subirADrive(buffer, nombre, mime, parentId) {
 }
 /* Copia legible del historial en la carpeta del expediente (la fuente de verdad es Postgres) */
 async function actualizarHistorialDrive(expedienteId) {
-  const doc = (await pool.query('SELECT carpeta_drive_id, historial_file_id FROM documentos WHERE expediente_id=$1 AND carpeta_drive_id IS NOT NULL LIMIT 1', [expedienteId])).rows[0];
+  let doc = (await pool.query('SELECT carpeta_drive_id, historial_file_id FROM documentos WHERE expediente_id=$1 AND carpeta_drive_id IS NOT NULL LIMIT 1', [expedienteId])).rows[0];
+  if (!doc) doc = (await pool.query('SELECT carpeta_drive_id, NULL as historial_file_id FROM procedimientos WHERE codigo_base=$1 AND carpeta_drive_id IS NOT NULL LIMIT 1', [expedienteId])).rows[0];
   if (!doc?.carpeta_drive_id) return;
   const entradas = (await pool.query('SELECT ts,autor,tipo,texto,adjuntos,hash FROM bitacora WHERE expediente_id=$1 ORDER BY id', [expedienteId])).rows;
   const contenido = JSON.stringify({ expediente: expedienteId, nota: 'Copia de lectura. Fuente de verdad: base de datos con cadena de integridad.', entradas }, null, 2);
@@ -301,6 +317,7 @@ async function actualizarHistorialDrive(expedienteId) {
       media: { mimeType: 'application/json', body: Readable.from(Buffer.from(contenido)) }, fields: 'id',
     });
     await pool.query('UPDATE documentos SET historial_file_id=$1 WHERE expediente_id=$2', [f.data.id, expedienteId]);
+    // para procedimientos no guardamos el file id: el archivo se encuentra por nombre en la carpeta
   }
 }
 
@@ -458,6 +475,93 @@ app.post('/api/migrar', auth(['admin']), async (req, res) => {
     await logAdmin(req.user.email, 'migracion_inicial', `${n} documentos importados desde Sheets`);
     programarEspejo();
     res.json({ ok: true, importados: n });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================================================
+   MÓDULO PROCEDIMIENTOS VADOCA (POEs con vigencia y versionado)
+   ============================================================ */
+app.get('/api/procedimientos', auth(), async (_req, res) => {
+  const r = await pool.query('SELECT * FROM procedimientos ORDER BY codigo_base, version');
+  res.json(r.rows);
+});
+
+app.post('/api/procedimientos', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { titulo, vigencia_meses } = req.body || {};
+    if (!titulo) return res.status(400).json({ error: 'Falta el título del procedimiento' });
+    const m = await pool.query("SELECT COALESCE(MAX(CAST(SUBSTRING(codigo_base FROM 'POE-(\\d+)') AS INT)),0) mx FROM procedimientos");
+    const num = m.rows[0].mx + 1;
+    const base = 'POE-' + String(num).padStart(3, '0');
+    const codigo = base + '/01';
+    // Carpeta: VADOCA_Gestion / 000 - VADOCA / Procedimientos / POE-xxx - Titulo
+    const fExp = await crearCarpetasExpediente('000', 'VADOCA', 'Procedimientos', `${base} - ${titulo}`);
+    const url = `https://drive.google.com/drive/folders/${fExp}`;
+    await pool.query(`INSERT INTO procedimientos(codigo,codigo_base,titulo,version,estado,vigencia_meses,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento)
+      VALUES($1,$2,$3,'01','Borrador',$4,$5,$6,$7,now())`,
+      [codigo, base, titulo, parseInt(vigencia_meses, 10) || 36, fExp, url, req.user.email]);
+    await agregarBitacora(base, req.user.email, 'creacion', `Procedimiento creado: ${codigo} — ${titulo}. Vigencia: ${parseInt(vigencia_meses, 10) || 36} meses desde su entrada en vigencia.`);
+    res.json({ ok: true, codigo, base, carpeta: url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/procedimientos/:codigo/estado', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { estado } = req.body || {};
+    const p = (await pool.query('SELECT * FROM procedimientos WHERE codigo=$1', [req.params.codigo])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Procedimiento no encontrado' });
+    if (estado === 'Vigente') {
+      const desde = new Date();
+      const vence = new Date(desde); vence.setMonth(vence.getMonth() + p.vigencia_meses);
+      await pool.query(`UPDATE procedimientos SET estado='Vigente', fecha_vigencia=$1, fecha_vencimiento=$2, ultimo_movimiento=now() WHERE codigo=$3`,
+        [desde.toISOString().slice(0, 10), vence.toISOString().slice(0, 10), p.codigo]);
+      // única versión vigente por procedimiento: las demás pasan a Obsoleto
+      const obs = await pool.query(`UPDATE procedimientos SET estado='Obsoleto', ultimo_movimiento=now() WHERE codigo_base=$1 AND codigo<>$2 AND estado='Vigente' RETURNING codigo`, [p.codigo_base, p.codigo]);
+      await agregarBitacora(p.codigo_base, req.user.email, 'estado', `${p.codigo} → VIGENTE desde ${desde.toISOString().slice(0, 10)}, vence ${vence.toISOString().slice(0, 10)}.` + (obs.rowCount ? ` Pasan a Obsoleto: ${obs.rows.map(r => r.codigo).join(', ')}.` : ''));
+    } else {
+      await pool.query('UPDATE procedimientos SET estado=$1, ultimo_movimiento=now() WHERE codigo=$2', [estado, p.codigo]);
+      await agregarBitacora(p.codigo_base, req.user.email, 'estado', `${p.codigo} → estado: ${estado}`);
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/procedimientos/:base/nueva-version', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { motivo, vigencia_meses } = req.body || {};
+    const ult = (await pool.query('SELECT * FROM procedimientos WHERE codigo_base=$1 ORDER BY CAST(version AS INT) DESC LIMIT 1', [req.params.base])).rows[0];
+    if (!ult) return res.status(404).json({ error: 'Procedimiento no encontrado' });
+    const nv = String(parseInt(ult.version, 10) + 1).padStart(2, '0');
+    const codigo = ult.codigo_base + '/' + nv;
+    await pool.query(`INSERT INTO procedimientos(codigo,codigo_base,titulo,version,estado,vigencia_meses,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento)
+      VALUES($1,$2,$3,$4,'Borrador',$5,$6,$7,$8,now())`,
+      [codigo, ult.codigo_base, ult.titulo, nv, parseInt(vigencia_meses, 10) || ult.vigencia_meses, ult.carpeta_drive_id, ult.carpeta_drive_url, req.user.email]);
+    await agregarBitacora(ult.codigo_base, req.user.email, 'version', `Nueva versión ${codigo} en Borrador.${motivo ? ' Motivo: ' + motivo : ''} La versión vigente sigue siéndolo hasta aprobar y poner en vigencia la nueva.`);
+    res.json({ ok: true, codigo });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/procedimientos/:base/notas', auth(['admin', 'editor']), upload.array('archivos', 10), async (req, res) => {
+  try {
+    const base = req.params.base;
+    const { texto, subcarpeta } = req.body || {};
+    const p = (await pool.query('SELECT * FROM procedimientos WHERE codigo_base=$1 LIMIT 1', [base])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Procedimiento no encontrado' });
+    const adjuntos = [];
+    if (req.files?.length) {
+      const drive = await driveCli();
+      const sub = SUBCARPETAS.includes(subcarpeta) ? subcarpeta : '01_versiones';
+      const subId = await ensureCarpeta(drive, sub, p.carpeta_drive_id);
+      for (const f of req.files) {
+        const nombre = `${ahora().slice(0, 10)}_${Buffer.from(f.originalname, 'latin1').toString('utf8')}`;
+        const up = await subirADrive(f.buffer, nombre, f.mimetype, subId);
+        adjuntos.push({ nombre, drive_id: up.id, subcarpeta: sub });
+      }
+    }
+    if (!texto && !adjuntos.length) return res.status(400).json({ error: 'La nota está vacía' });
+    const entrada = await agregarBitacora(base, req.user.email, adjuntos.length ? 'archivo' : 'nota', texto || `Se subieron ${adjuntos.length} archivo(s)`, adjuntos);
+    await pool.query('UPDATE procedimientos SET ultimo_movimiento=now() WHERE codigo_base=$1', [base]);
+    res.json({ ok: true, entrada });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
