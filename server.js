@@ -106,6 +106,12 @@ CREATE TABLE IF NOT EXISTS procedimientos (
   creado TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_proc_base ON procedimientos(codigo_base);
+CREATE TABLE IF NOT EXISTS poe_relaciones (
+  id SERIAL PRIMARY KEY,
+  base TEXT NOT NULL,
+  relacionado TEXT NOT NULL,
+  UNIQUE(base, relacionado)
+);
 CREATE TABLE IF NOT EXISTS admin_log (
   id SERIAL PRIMARY KEY,
   ts TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -508,6 +514,28 @@ app.post('/api/procedimientos', auth(['admin', 'editor']), async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Relaciones entre POEs (bidireccionales a efectos del análisis de impacto) */
+app.get('/api/poe-relaciones', auth(), async (_req, res) => {
+  const r = await pool.query('SELECT base, relacionado FROM poe_relaciones ORDER BY base');
+  res.json(r.rows);
+});
+app.post('/api/poe-relaciones/:base', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const base = req.params.base;
+    const rels = [...new Set((req.body?.relacionados || []).filter(r => r && r !== base))];
+    const antes = (await pool.query('SELECT relacionado FROM poe_relaciones WHERE base=$1 ORDER BY relacionado', [base])).rows.map(r => r.relacionado);
+    await pool.query('DELETE FROM poe_relaciones WHERE base=$1', [base]);
+    for (const r of rels) await pool.query('INSERT INTO poe_relaciones(base,relacionado) VALUES($1,$2) ON CONFLICT DO NOTHING', [base, r]);
+    if (JSON.stringify(antes) !== JSON.stringify([...rels].sort()))
+      await agregarBitacora(base, req.user.email, 'relacion', `Documentos relacionados actualizados: ${rels.length ? rels.join(', ') : 'ninguno'}${antes.length ? ' (antes: ' + antes.join(', ') + ')' : ''}`);
+    res.json({ ok: true, relacionados: rels });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+async function relacionadosDePoe(base) { // ambas direcciones, sin duplicados
+  const r = await pool.query('SELECT relacionado x FROM poe_relaciones WHERE base=$1 UNION SELECT base x FROM poe_relaciones WHERE relacionado=$1', [base]);
+  return r.rows.map(x => x.x);
+}
+
 app.post('/api/procedimientos/importar', auth(['admin']), async (req, res) => {
   try {
     const { filas } = req.body || {}; // [{sector, numero, version, titulo, fecha_vigencia, vigencia_meses}]
@@ -573,8 +601,9 @@ app.post('/api/procedimientos/:base/nueva-version', auth(['admin', 'editor']), a
     await pool.query(`INSERT INTO procedimientos(codigo,codigo_base,titulo,version,estado,vigencia_meses,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento)
       VALUES($1,$2,$3,$4,'Borrador',$5,$6,$7,$8,now())`,
       [codigo, ult.codigo_base, ult.titulo, nv, parseInt(vigencia_meses, 10) || ult.vigencia_meses, ult.carpeta_drive_id, ult.carpeta_drive_url, req.user.email]);
-    await agregarBitacora(ult.codigo_base, req.user.email, 'version', `Nueva versión ${codigo} en Borrador.${motivo ? ' Motivo: ' + motivo : ''} La versión vigente sigue siéndolo hasta aprobar y poner en vigencia la nueva.`);
-    res.json({ ok: true, codigo });
+    const impactados = await relacionadosDePoe(ult.codigo_base);
+    await agregarBitacora(ult.codigo_base, req.user.email, 'version', `Nueva versión ${codigo} en Borrador.${motivo ? ' Motivo: ' + motivo : ''} La versión vigente sigue siéndolo hasta aprobar y poner en vigencia la nueva.` + (impactados.length ? ` Impacto a evaluar sobre documentos relacionados: ${impactados.join(', ')}.` : ''));
+    res.json({ ok: true, codigo, impactados });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
