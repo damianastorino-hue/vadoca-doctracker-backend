@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS procedimientos (
   id SERIAL PRIMARY KEY,
   codigo TEXT UNIQUE NOT NULL,
   codigo_base TEXT NOT NULL,
+  sector TEXT NOT NULL DEFAULT '',
   titulo TEXT NOT NULL,
   version TEXT NOT NULL DEFAULT '01',
   estado TEXT NOT NULL DEFAULT 'Borrador',
@@ -118,6 +119,7 @@ CREATE TABLE IF NOT EXISTS admin_log (
 
 async function boot() {
   await pool.query(SCHEMA);
+  await pool.query("ALTER TABLE procedimientos ADD COLUMN IF NOT EXISTS sector TEXT NOT NULL DEFAULT ''");
   // Superusuario inicial
   if (ADMIN_EMAIL && ADMIN_PASSWORD) {
     const r = await pool.query('SELECT 1 FROM usuarios WHERE email=$1', [ADMIN_EMAIL.toLowerCase()]);
@@ -488,20 +490,55 @@ app.get('/api/procedimientos', auth(), async (_req, res) => {
 
 app.post('/api/procedimientos', auth(['admin', 'editor']), async (req, res) => {
   try {
-    const { titulo, vigencia_meses } = req.body || {};
+    const { titulo, vigencia_meses, sector } = req.body || {};
     if (!titulo) return res.status(400).json({ error: 'Falta el título del procedimiento' });
-    const m = await pool.query("SELECT COALESCE(MAX(CAST(SUBSTRING(codigo_base FROM 'POE-(\\d+)') AS INT)),0) mx FROM procedimientos");
+    const sec = String(sector || 'POE').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6) || 'POE';
+    // Correlativo GLOBAL: número siguiente al máximo de todos los POEs, sin importar el sector
+    const m = await pool.query("SELECT COALESCE(MAX(CAST(SUBSTRING(codigo_base FROM '(\\d+)$') AS INT)),0) mx FROM procedimientos");
     const num = m.rows[0].mx + 1;
-    const base = 'POE-' + String(num).padStart(3, '0');
+    const base = sec + '-' + String(num).padStart(3, '0');
     const codigo = base + '/01';
-    // Carpeta: VADOCA_Gestion / 000 - VADOCA / Procedimientos / POE-xxx - Titulo
     const fExp = await crearCarpetasExpediente('000', 'VADOCA', 'Procedimientos', `${base} - ${titulo}`);
     const url = `https://drive.google.com/drive/folders/${fExp}`;
-    await pool.query(`INSERT INTO procedimientos(codigo,codigo_base,titulo,version,estado,vigencia_meses,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento)
-      VALUES($1,$2,$3,'01','Borrador',$4,$5,$6,$7,now())`,
-      [codigo, base, titulo, parseInt(vigencia_meses, 10) || 36, fExp, url, req.user.email]);
+    await pool.query(`INSERT INTO procedimientos(codigo,codigo_base,sector,titulo,version,estado,vigencia_meses,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento)
+      VALUES($1,$2,$3,$4,'01','Borrador',$5,$6,$7,$8,now())`,
+      [codigo, base, sec, titulo, parseInt(vigencia_meses, 10) || 36, fExp, url, req.user.email]);
     await agregarBitacora(base, req.user.email, 'creacion', `Procedimiento creado: ${codigo} — ${titulo}. Vigencia: ${parseInt(vigencia_meses, 10) || 36} meses desde su entrada en vigencia.`);
     res.json({ ok: true, codigo, base, carpeta: url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/procedimientos/importar', auth(['admin']), async (req, res) => {
+  try {
+    const { filas } = req.body || {}; // [{sector, numero, version, titulo, fecha_vigencia, vigencia_meses}]
+    if (!Array.isArray(filas) || !filas.length) return res.status(400).json({ error: 'No hay filas para importar' });
+    let importados = 0, saltados = 0; const errores = [];
+    for (const f of filas) {
+      try {
+        const sec = String(f.sector || 'POE').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6) || 'POE';
+        const num = String(parseInt(f.numero, 10)).padStart(3, '0');
+        const ver = String(parseInt(f.version, 10) || 1).padStart(2, '0');
+        if (!f.titulo || isNaN(parseInt(f.numero, 10))) throw new Error('faltan título o número');
+        const base = sec + '-' + num, codigo = base + '/' + ver;
+        const meses = parseInt(f.vigencia_meses, 10) || 36;
+        let venc = null, estado = 'Borrador';
+        if (f.fecha_vigencia) {
+          const d = new Date(f.fecha_vigencia + 'T00:00:00');
+          if (isNaN(d)) throw new Error('fecha inválida (usar AAAA-MM-DD)');
+          const v = new Date(d); v.setMonth(v.getMonth() + meses);
+          venc = v.toISOString().slice(0, 10); estado = 'Vigente';
+        }
+        const r = await pool.query(`INSERT INTO procedimientos(codigo,codigo_base,sector,titulo,version,estado,vigencia_meses,fecha_vigencia,fecha_vencimiento,autor,ultimo_movimiento)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now()) ON CONFLICT (codigo) DO NOTHING RETURNING id`,
+          [codigo, base, sec, String(f.titulo).trim().slice(0, 120), ver, estado, meses, f.fecha_vigencia || null, venc, 'importacion@' + req.user.email]);
+        if (r.rowCount) {
+          importados++;
+          await agregarBitacora(base, req.user.email, 'creacion', `Importado del sistema documental previo: ${codigo} — ${f.titulo}.` + (venc ? ` Vigente desde ${f.fecha_vigencia}, vence ${venc}.` : ''));
+        } else saltados++;
+      } catch (err) { errores.push((f.sector || '?') + '-' + (f.numero || '?') + ': ' + err.message); }
+    }
+    await logAdmin(req.user.email, 'importacion_poes', `${importados} importados, ${saltados} ya existían, ${errores.length} con error`);
+    res.json({ ok: true, importados, saltados, errores });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -545,17 +582,34 @@ app.post('/api/procedimientos/:base/notas', auth(['admin', 'editor']), upload.ar
   try {
     const base = req.params.base;
     const { texto, subcarpeta } = req.body || {};
-    const p = (await pool.query('SELECT * FROM procedimientos WHERE codigo_base=$1 LIMIT 1', [base])).rows[0];
+    let p = (await pool.query('SELECT * FROM procedimientos WHERE codigo_base=$1 LIMIT 1', [base])).rows[0];
     if (!p) return res.status(404).json({ error: 'Procedimiento no encontrado' });
+    if (!p.carpeta_drive_id) { // importado sin carpeta: se crea acá, una sola vez
+      const fExp = await crearCarpetasExpediente('000', 'VADOCA', 'Procedimientos', `${base} - ${p.titulo}`);
+      await pool.query('UPDATE procedimientos SET carpeta_drive_id=$1, carpeta_drive_url=$2 WHERE codigo_base=$3',
+        [fExp, `https://drive.google.com/drive/folders/${fExp}`, base]);
+      p.carpeta_drive_id = fExp;
+    }
     const adjuntos = [];
     if (req.files?.length) {
       const drive = await driveCli();
       const sub = SUBCARPETAS.includes(subcarpeta) ? subcarpeta : '01_versiones';
       const subId = await ensureCarpeta(drive, sub, p.carpeta_drive_id);
+      // Nombre asignado por el sistema (integridad de nomenclatura): no importa cómo se llame el archivo original.
+      const ult = (await pool.query('SELECT MAX(CAST(version AS INT)) v FROM procedimientos WHERE codigo_base=$1', [base])).rows[0].v || 1;
+      const ver = String(ult).padStart(2, '0');
+      let i = 0;
       for (const f of req.files) {
-        const nombre = `${ahora().slice(0, 10)}_${Buffer.from(f.originalname, 'latin1').toString('utf8')}`;
+        i++;
+        const orig = Buffer.from(f.originalname, 'latin1').toString('utf8');
+        const ext = (orig.match(/\.[A-Za-z0-9]+$/) || [''])[0].toLowerCase();
+        const sufijo = req.files.length > 1 ? '_' + i : '';
+        let nombre;
+        if (sub === '03_entregables')      nombre = `${base}_v${ver}_${ahora().slice(0, 10)}${sufijo}${ext}`;
+        else if (sub === '01_versiones')   nombre = `${base}_v${ver}_borrador_${ahora().slice(0, 10)}${sufijo}${ext}`;
+        else                               nombre = `${ahora().slice(0, 10)}_${orig}`; // evidencias conservan su identidad
         const up = await subirADrive(f.buffer, nombre, f.mimetype, subId);
-        adjuntos.push({ nombre, drive_id: up.id, subcarpeta: sub });
+        adjuntos.push({ nombre, original: orig, drive_id: up.id, subcarpeta: sub });
       }
     }
     if (!texto && !adjuntos.length) return res.status(400).json({ error: 'La nota está vacía' });
