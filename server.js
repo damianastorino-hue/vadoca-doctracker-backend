@@ -106,6 +106,37 @@ CREATE TABLE IF NOT EXISTS procedimientos (
   creado TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_proc_base ON procedimientos(codigo_base);
+CREATE TABLE IF NOT EXISTS presupuestos (
+  id SERIAL PRIMARY KEY,
+  codigo TEXT UNIQUE NOT NULL,
+  cliente_num TEXT, cliente_nombre TEXT,
+  descripcion TEXT NOT NULL,
+  monto NUMERIC, moneda TEXT DEFAULT 'ARS',
+  fecha_emision TEXT,
+  estado TEXT NOT NULL DEFAULT 'Borrador',
+  carpeta_drive_id TEXT, carpeta_drive_url TEXT,
+  autor TEXT NOT NULL,
+  ultimo_movimiento TIMESTAMPTZ,
+  creado TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS proyectos (
+  id SERIAL PRIMARY KEY,
+  codigo TEXT UNIQUE NOT NULL,
+  nombre TEXT NOT NULL,
+  cliente_num TEXT, cliente_nombre TEXT,
+  alcance TEXT DEFAULT '',
+  estado TEXT NOT NULL DEFAULT 'Activo',
+  carpeta_drive_id TEXT, carpeta_drive_url TEXT,
+  autor TEXT NOT NULL,
+  ultimo_movimiento TIMESTAMPTZ,
+  creado TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS proyecto_presupuestos (
+  id SERIAL PRIMARY KEY,
+  proyecto TEXT NOT NULL,
+  presupuesto TEXT NOT NULL,
+  UNIQUE(proyecto, presupuesto)
+);
 CREATE TABLE IF NOT EXISTS poe_relaciones (
   id SERIAL PRIMARY KEY,
   base TEXT NOT NULL,
@@ -126,6 +157,7 @@ CREATE TABLE IF NOT EXISTS admin_log (
 async function boot() {
   await pool.query(SCHEMA);
   await pool.query("ALTER TABLE procedimientos ADD COLUMN IF NOT EXISTS sector TEXT NOT NULL DEFAULT ''");
+  await pool.query("ALTER TABLE documentos ADD COLUMN IF NOT EXISTS proyecto TEXT NOT NULL DEFAULT ''");
   // Superusuario inicial
   if (ADMIN_EMAIL && ADMIN_PASSWORD) {
     const r = await pool.query('SELECT 1 FROM usuarios WHERE email=$1', [ADMIN_EMAIL.toLowerCase()]);
@@ -337,16 +369,28 @@ async function espejar() {
   if (!SHEET_ID) return;
   const sheets = await sheetsCli();
   const meta = await sheets.spreadsheets.get({ spreadsheetId: SHEET_ID, fields: 'sheets.properties' });
-  if (!meta.data.sheets.some(s => s.properties.title === 'REGISTRO')) {
-    await sheets.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests: [{ addSheet: { properties: { title: 'REGISTRO' } } }] } });
+  const titulos = meta.data.sheets.map(s => s.properties.title);
+  const faltan = ['REGISTRO', 'PROCEDIMIENTOS', 'PRESUPUESTOS', 'PROYECTOS'].filter(t => !titulos.includes(t));
+  if (faltan.length) await sheets.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests: faltan.map(t => ({ addSheet: { properties: { title: t } } })) } });
+  const NOTA = 'ESPEJO DE SOLO LECTURA — editar aquí NO modifica el sistema. Fuente de verdad: base de datos DocTracker.';
+  async function hoja(titulo, encabezados, filas) {
+    await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: `'${titulo}'!A:Z` });
+    await sheets.spreadsheets.values.update({ spreadsheetId: SHEET_ID, range: `'${titulo}'!A1`, valueInputOption: 'RAW',
+      requestBody: { values: [[NOTA], encabezados, ...filas] } });
   }
   const docs = (await pool.query('SELECT * FROM documentos ORDER BY id')).rows;
-  const filas = docs.map(d => [d.codigo, d.fecha_alta, d.cliente_num, d.cliente_nombre, d.tipo_trabajo, d.linea, d.prot_inf, d.tipo_doc, d.doc_num, d.version, d.descripcion, d.codigo_interno_cliente, d.ref_presupuesto, d.estado, d.fecha_inicio, d.fecha_fin, d.carpeta_drive_url, d.autor, d.ultimo_movimiento ? new Date(d.ultimo_movimiento).toISOString() : '', d.conflicto_legacy ? 'TRUE' : '', d.observaciones, d.expediente_id]);
-  await sheets.spreadsheets.values.clear({ spreadsheetId: SHEET_ID, range: "'REGISTRO'!A:Z" });
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID, range: "'REGISTRO'!A1", valueInputOption: 'RAW',
-    requestBody: { values: [['ESPEJO DE SOLO LECTURA — editar aquí NO modifica el sistema. Fuente de verdad: base de datos DocTracker.'], COLS, ...filas] },
-  });
+  await hoja('REGISTRO', [...COLS, 'Proyecto'],
+    docs.map(d => [d.codigo, d.fecha_alta, d.cliente_num, d.cliente_nombre, d.tipo_trabajo, d.linea, d.prot_inf, d.tipo_doc, d.doc_num, d.version, d.descripcion, d.codigo_interno_cliente, d.ref_presupuesto, d.estado, d.fecha_inicio, d.fecha_fin, d.carpeta_drive_url, d.autor, d.ultimo_movimiento ? new Date(d.ultimo_movimiento).toISOString() : '', d.conflicto_legacy ? 'TRUE' : '', d.observaciones, d.expediente_id, d.proyecto || '']));
+  const poes = (await pool.query('SELECT * FROM procedimientos ORDER BY codigo_base, version')).rows;
+  await hoja('PROCEDIMIENTOS', ['Codigo', 'Sector', 'Titulo', 'Version', 'Estado', 'Vigencia_Meses', 'Fecha_Vigencia', 'Fecha_Vencimiento', 'Autor', 'Ultimo_Movimiento', 'Carpeta_Drive'],
+    poes.map(p => [p.codigo, p.sector, p.titulo, p.version, p.estado, p.vigencia_meses, p.fecha_vigencia || '', p.fecha_vencimiento || '', p.autor, p.ultimo_movimiento ? new Date(p.ultimo_movimiento).toISOString() : '', p.carpeta_drive_url || '']));
+  const pres = (await pool.query('SELECT * FROM presupuestos ORDER BY codigo')).rows;
+  await hoja('PRESUPUESTOS', ['Codigo', 'Cliente', 'Descripcion', 'Monto', 'Moneda', 'Fecha_Emision', 'Estado', 'Autor', 'Ultimo_Movimiento'],
+    pres.map(p => [p.codigo, (p.cliente_num || '') + ' - ' + (p.cliente_nombre || ''), p.descripcion, p.monto || '', p.moneda || '', p.fecha_emision || '', p.estado, p.autor, p.ultimo_movimiento ? new Date(p.ultimo_movimiento).toISOString() : '']));
+  const proys = (await pool.query('SELECT * FROM proyectos ORDER BY codigo')).rows;
+  const vincs = (await pool.query('SELECT * FROM proyecto_presupuestos')).rows;
+  await hoja('PROYECTOS', ['Codigo', 'Nombre', 'Cliente', 'Estado', 'Presupuestos', 'Alcance', 'Autor', 'Ultimo_Movimiento'],
+    proys.map(p => [p.codigo, p.nombre, (p.cliente_num || '') + ' - ' + (p.cliente_nombre || ''), p.estado, vincs.filter(v => v.proyecto === p.codigo).map(v => v.presupuesto).join(', '), (p.alcance || '').slice(0, 500), p.autor, p.ultimo_movimiento ? new Date(p.ultimo_movimiento).toISOString() : '']));
 }
 
 /* ============================================================
@@ -377,7 +421,7 @@ app.get('/api/expedientes/:id/verificar', auth(), async (req, res) => {
 
 app.post('/api/expedientes', auth(['admin', 'editor']), async (req, res) => {
   try {
-    const { ttKey, ttNombre, linea, cliente, clienteNombre, docs, desc, interno, presupuesto } = req.body || {};
+    const { ttKey, ttNombre, linea, cliente, clienteNombre, docs, desc, interno, presupuesto, proyecto } = req.body || {};
     if (!ttKey || !cliente || !desc || !Array.isArray(docs) || !docs.length) return res.status(400).json({ error: 'Faltan datos del expediente' });
     // Número siguiente con verificación en base (sin carreras)
     const r = await pool.query("SELECT COALESCE(MAX(CAST(doc_num AS INT)),0) m FROM documentos WHERE expediente_id LIKE $1", [`${ttKey}-${cliente}-%`]);
@@ -387,9 +431,9 @@ app.post('/api/expedientes', auth(['admin', 'editor']), async (req, res) => {
     const fExp = await crearCarpetasExpediente(cliente, clienteNombre || '', ttNombre || ttKey, `${expId} - ${desc}`);
     const url = `https://drive.google.com/drive/folders/${fExp}`;
     for (const [td, pi] of docs) {
-      await pool.query(`INSERT INTO documentos(codigo,expediente_id,fecha_alta,cliente_num,cliente_nombre,tipo_trabajo,linea,prot_inf,tipo_doc,doc_num,version,descripcion,codigo_interno_cliente,ref_presupuesto,estado,fecha_inicio,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'Borrador',$3,$15,$16,$17,now())`,
-        [armarID(linea, td, pi, cliente, doc, 1), expId, ahora().slice(0, 10), cliente, clienteNombre || '', ttNombre || ttKey, linea, pi, td, pad(doc, 3), '01', desc, interno || '', presupuesto || '', fExp, url, req.user.email]);
+      await pool.query(`INSERT INTO documentos(codigo,expediente_id,fecha_alta,cliente_num,cliente_nombre,tipo_trabajo,linea,prot_inf,tipo_doc,doc_num,version,descripcion,codigo_interno_cliente,ref_presupuesto,estado,fecha_inicio,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento,proyecto)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'Borrador',$3,$15,$16,$17,now(),$18)`,
+        [armarID(linea, td, pi, cliente, doc, 1), expId, ahora().slice(0, 10), cliente, clienteNombre || '', ttNombre || ttKey, linea, pi, td, pad(doc, 3), '01', desc, interno || '', presupuesto || '', fExp, url, req.user.email, proyecto || '']);
     }
     await agregarBitacora(expId, req.user.email, 'creacion', `Expediente creado. Documentos: ${docs.map(d => d[0] + '-' + d[1]).join(', ')}. Descripción: ${desc}`);
     programarEspejo();
@@ -678,6 +722,167 @@ app.post('/api/importar-historiales', auth(['admin']), async (req, res) => {
     }
     await logAdmin(req.user.email, 'importacion_historiales_v1', `${importadas} entradas recuperadas; ${saltados} expedientes ya tenían bitácora`);
     res.json({ ok: true, entradas: importadas, expedientes: exps.length, saltados, errores });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================================================
+   MÓDULO PRESUPUESTOS (acceso exclusivo del rol admin)
+   ============================================================ */
+app.get('/api/presupuestos', auth(['admin']), async (_req, res) => {
+  res.json((await pool.query('SELECT * FROM presupuestos ORDER BY codigo DESC')).rows);
+});
+app.post('/api/presupuestos', auth(['admin']), async (req, res) => {
+  try {
+    const { cliente, clienteNombre, descripcion, monto, moneda, fecha_emision } = req.body || {};
+    if (!descripcion) return res.status(400).json({ error: 'Falta la descripción' });
+    // Correlativo que continúa la serie histórica (último conocido: 0081)
+    const m = await pool.query("SELECT COALESCE(MAX(CAST(codigo AS INT)), 81) mx FROM presupuestos");
+    const codigo = String(m.rows[0].mx + 1).padStart(4, '0');
+    await pool.query(`INSERT INTO presupuestos(codigo,cliente_num,cliente_nombre,descripcion,monto,moneda,fecha_emision,estado,autor,ultimo_movimiento)
+      VALUES($1,$2,$3,$4,$5,$6,$7,'Borrador',$8,now())`,
+      [codigo, cliente || '', clienteNombre || '', descripcion, monto || null, moneda || 'ARS', fecha_emision || ahora().slice(0, 10), req.user.email]);
+    await agregarBitacora('PRES-' + codigo, req.user.email, 'creacion', `Presupuesto ${codigo} creado — ${descripcion}${monto ? ' (' + (moneda || 'ARS') + ' ' + monto + ')' : ''}.`);
+    res.json({ ok: true, codigo });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/presupuestos/:codigo/estado', auth(['admin']), async (req, res) => {
+  try {
+    const { estado } = req.body || {};
+    const r = await pool.query('UPDATE presupuestos SET estado=$1, ultimo_movimiento=now() WHERE codigo=$2 RETURNING codigo', [estado, req.params.codigo]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+    await agregarBitacora('PRES-' + req.params.codigo, req.user.email, 'estado', `Presupuesto ${req.params.codigo} → ${estado}`);
+    programarEspejo();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/presupuestos/:codigo/notas', auth(['admin']), upload.array('archivos', 10), async (req, res) => {
+  try {
+    const cod = req.params.codigo;
+    let p = (await pool.query('SELECT * FROM presupuestos WHERE codigo=$1', [cod])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+    if (!p.carpeta_drive_id) {
+      const fExp = await crearCarpetasExpediente(p.cliente_num || '000', p.cliente_nombre || 'VADOCA', 'Presupuestos', `${cod} - ${p.descripcion}`);
+      await pool.query('UPDATE presupuestos SET carpeta_drive_id=$1, carpeta_drive_url=$2 WHERE codigo=$3', [fExp, `https://drive.google.com/drive/folders/${fExp}`, cod]);
+      p.carpeta_drive_id = fExp;
+    }
+    const adjuntos = [];
+    if (req.files?.length) {
+      const drive = await driveCli();
+      const sub = SUBCARPETAS.includes(req.body?.subcarpeta) ? req.body.subcarpeta : '02_evidencias';
+      const subId = await ensureCarpeta(drive, sub, p.carpeta_drive_id);
+      for (const f of req.files) {
+        const nombre = `${ahora().slice(0, 10)}_${Buffer.from(f.originalname, 'latin1').toString('utf8')}`;
+        const up = await subirADrive(f.buffer, nombre, f.mimetype, subId);
+        adjuntos.push({ nombre, drive_id: up.id, subcarpeta: sub });
+      }
+    }
+    const texto = (req.body?.texto || '').trim();
+    if (!texto && !adjuntos.length) return res.status(400).json({ error: 'La nota está vacía' });
+    const entrada = await agregarBitacora('PRES-' + cod, req.user.email, adjuntos.length ? 'archivo' : 'nota', texto || `Se subieron ${adjuntos.length} archivo(s)`, adjuntos);
+    await pool.query('UPDATE presupuestos SET ultimo_movimiento=now() WHERE codigo=$1', [cod]);
+    res.json({ ok: true, entrada });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================================================
+   MÓDULO PROYECTOS
+   ============================================================ */
+app.get('/api/proyectos', auth(), async (_req, res) => {
+  const proys = (await pool.query('SELECT * FROM proyectos ORDER BY codigo')).rows;
+  const vincs = (await pool.query('SELECT * FROM proyecto_presupuestos')).rows;
+  res.json(proys.map(p => ({ ...p, presupuestos: vincs.filter(v => v.proyecto === p.codigo).map(v => v.presupuesto) })));
+});
+app.post('/api/proyectos', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { nombre, cliente, clienteNombre, alcance } = req.body || {};
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre del proyecto' });
+    const m = await pool.query("SELECT COALESCE(MAX(CAST(SUBSTRING(codigo FROM 'PRJ-(\\d+)') AS INT)),0) mx FROM proyectos");
+    const codigo = 'PRJ-' + String(m.rows[0].mx + 1).padStart(3, '0');
+    await pool.query(`INSERT INTO proyectos(codigo,nombre,cliente_num,cliente_nombre,alcance,estado,autor,ultimo_movimiento)
+      VALUES($1,$2,$3,$4,$5,'Activo',$6,now())`, [codigo, nombre, cliente || '', clienteNombre || '', alcance || '', req.user.email]);
+    await agregarBitacora(codigo, req.user.email, 'creacion', `Proyecto ${codigo} creado — ${nombre}.`);
+    programarEspejo();
+    res.json({ ok: true, codigo });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/proyectos/:codigo/actualizar', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { alcance, estado } = req.body || {};
+    const p = (await pool.query('SELECT * FROM proyectos WHERE codigo=$1', [req.params.codigo])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    const cambios = [];
+    if (estado && estado !== p.estado) cambios.push(`estado → ${estado}`);
+    if (alcance !== undefined && alcance !== p.alcance) cambios.push('alcance actualizado');
+    await pool.query('UPDATE proyectos SET alcance=COALESCE($1,alcance), estado=COALESCE($2,estado), ultimo_movimiento=now() WHERE codigo=$3',
+      [alcance, estado, req.params.codigo]);
+    if (cambios.length) await agregarBitacora(req.params.codigo, req.user.email, 'estado', `Proyecto ${req.params.codigo}: ${cambios.join('; ')}.`);
+    programarEspejo();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+/* Vinculación de presupuestos (solo admin: es quien ve el módulo de presupuestos) */
+app.post('/api/proyectos/:codigo/presupuestos', auth(['admin']), async (req, res) => {
+  try {
+    const cod = req.params.codigo;
+    const lista = [...new Set(req.body?.presupuestos || [])];
+    await pool.query('DELETE FROM proyecto_presupuestos WHERE proyecto=$1', [cod]);
+    for (const pr of lista) await pool.query('INSERT INTO proyecto_presupuestos(proyecto,presupuesto) VALUES($1,$2) ON CONFLICT DO NOTHING', [cod, pr]);
+    await agregarBitacora(cod, req.user.email, 'relacion', `Presupuestos vinculados: ${lista.length ? lista.join(', ') : 'ninguno'}.`);
+    programarEspejo();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+/* Autovinculación de expedientes por referencia de presupuesto */
+app.post('/api/proyectos/:codigo/autovincular', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const cod = req.params.codigo;
+    const pres = (await pool.query('SELECT presupuesto FROM proyecto_presupuestos WHERE proyecto=$1', [cod])).rows.map(r => r.presupuesto);
+    if (!pres.length) return res.status(400).json({ error: 'El proyecto no tiene presupuestos vinculados' });
+    const r = await pool.query(`UPDATE documentos SET proyecto=$1 WHERE ref_presupuesto = ANY($2) AND (proyecto IS NULL OR proyecto='') RETURNING expediente_id`, [cod, pres]);
+    const exps = [...new Set(r.rows.map(x => x.expediente_id))];
+    await agregarBitacora(cod, req.user.email, 'relacion', `Autovinculación por presupuesto (${pres.join(', ')}): ${exps.length} expediente(s) asociado(s).`);
+    programarEspejo();
+    res.json({ ok: true, expedientes: exps.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+/* Asignar/cambiar proyecto de un expediente */
+app.post('/api/expedientes/:id/proyecto', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { proyecto } = req.body || {};
+    const r = await pool.query("UPDATE documentos SET proyecto=$1 WHERE expediente_id=$2 RETURNING codigo", [proyecto || '', req.params.id]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Expediente no encontrado' });
+    await agregarBitacora(req.params.id, req.user.email, 'relacion', proyecto ? `Expediente vinculado al proyecto ${proyecto}.` : 'Expediente desvinculado de proyecto.');
+    if (proyecto) await agregarBitacora(proyecto, req.user.email, 'relacion', `Expediente ${req.params.id} vinculado al proyecto.`);
+    programarEspejo();
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/proyectos/:codigo/notas', auth(['admin', 'editor']), upload.array('archivos', 10), async (req, res) => {
+  try {
+    const cod = req.params.codigo;
+    let p = (await pool.query('SELECT * FROM proyectos WHERE codigo=$1', [cod])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Proyecto no encontrado' });
+    if (!p.carpeta_drive_id) {
+      const fExp = await crearCarpetasExpediente(p.cliente_num || '000', p.cliente_nombre || 'VADOCA', 'Proyectos', `${cod} - ${p.nombre}`);
+      await pool.query('UPDATE proyectos SET carpeta_drive_id=$1, carpeta_drive_url=$2 WHERE codigo=$3', [fExp, `https://drive.google.com/drive/folders/${fExp}`, cod]);
+      p.carpeta_drive_id = fExp;
+    }
+    const adjuntos = [];
+    if (req.files?.length) {
+      const drive = await driveCli();
+      const sub = SUBCARPETAS.includes(req.body?.subcarpeta) ? req.body.subcarpeta : '02_evidencias';
+      const subId = await ensureCarpeta(drive, sub, p.carpeta_drive_id);
+      for (const f of req.files) {
+        const nombre = `${ahora().slice(0, 10)}_${Buffer.from(f.originalname, 'latin1').toString('utf8')}`;
+        const up = await subirADrive(f.buffer, nombre, f.mimetype, subId);
+        adjuntos.push({ nombre, drive_id: up.id, subcarpeta: sub });
+      }
+    }
+    const texto = (req.body?.texto || '').trim();
+    if (!texto && !adjuntos.length) return res.status(400).json({ error: 'La nota está vacía' });
+    const entrada = await agregarBitacora(cod, req.user.email, adjuntos.length ? 'archivo' : 'nota', texto || `Se subieron ${adjuntos.length} archivo(s)`, adjuntos);
+    await pool.query('UPDATE proyectos SET ultimo_movimiento=now() WHERE codigo=$1', [cod]);
+    res.json({ ok: true, entrada });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
