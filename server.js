@@ -441,6 +441,55 @@ app.post('/api/expedientes', auth(['admin', 'editor']), async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Corrección controlada de datos descriptivos (el código VADOCA es inmutable) */
+app.post('/api/expedientes/:id/corregir', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { descripcion, interno, presupuesto, observaciones, motivo } = req.body || {};
+    if (!motivo || !motivo.trim()) return res.status(400).json({ error: 'El motivo de la corrección es obligatorio' });
+    const docs = (await pool.query('SELECT * FROM documentos WHERE expediente_id=$1', [req.params.id])).rows;
+    if (!docs.length) return res.status(404).json({ error: 'Expediente no encontrado' });
+    const antes = docs[0];
+    const cambios = [];
+    if (descripcion !== undefined && descripcion !== antes.descripcion) cambios.push(`Descripción: "${antes.descripcion}" → "${descripcion}"`);
+    if (interno !== undefined && interno !== antes.codigo_interno_cliente) cambios.push(`Cód. interno cliente: "${antes.codigo_interno_cliente || '—'}" → "${interno || '—'}"`);
+    if (presupuesto !== undefined && presupuesto !== antes.ref_presupuesto) cambios.push(`Ref. presupuesto: "${antes.ref_presupuesto || '—'}" → "${presupuesto || '—'}"`);
+    if (observaciones !== undefined && observaciones !== antes.observaciones) cambios.push(`Observaciones actualizadas`);
+    if (!cambios.length) return res.status(400).json({ error: 'No hay cambios para aplicar' });
+    await pool.query(`UPDATE documentos SET descripcion=COALESCE($1,descripcion), codigo_interno_cliente=COALESCE($2,codigo_interno_cliente),
+      ref_presupuesto=COALESCE($3,ref_presupuesto), observaciones=COALESCE($4,observaciones), ultimo_movimiento=now() WHERE expediente_id=$5`,
+      [descripcion, interno, presupuesto, observaciones, req.params.id]);
+    await agregarBitacora(req.params.id, req.user.email, 'correccion',
+      `CORRECCIÓN DE DATOS. Motivo: ${motivo.trim()}. Cambios: ${cambios.join(' | ')}. (El código VADOCA no se modifica; para códigos mal asignados: cancelar el documento y crear el correcto.)`);
+    programarEspejo();
+    res.json({ ok: true, cambios });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* Reconstrucción de presupuestos históricos desde las referencias del registro */
+app.post('/api/presupuestos/importar-desde-registro', auth(['admin']), async (req, res) => {
+  try {
+    const refs = (await pool.query(`SELECT ref_presupuesto rp, MIN(cliente_num) cn, MIN(cliente_nombre) cno,
+        STRING_AGG(DISTINCT tipo_trabajo, ' + ') tt, COUNT(DISTINCT expediente_id) n
+      FROM documentos WHERE ref_presupuesto IS NOT NULL AND ref_presupuesto <> '' AND ref_presupuesto ~ '^\\d+$'
+      GROUP BY ref_presupuesto ORDER BY ref_presupuesto`)).rows;
+    let creados = 0, saltados = 0;
+    for (const r of refs) {
+      const codigo = r.rp.padStart(4, '0');
+      const existe = await pool.query('SELECT 1 FROM presupuestos WHERE codigo=$1', [codigo]);
+      if (existe.rowCount) { saltados++; continue; }
+      await pool.query(`INSERT INTO presupuestos(codigo,cliente_num,cliente_nombre,descripcion,estado,autor,ultimo_movimiento)
+        VALUES($1,$2,$3,$4,'Aceptado',$5,now())`,
+        [codigo, r.cn || '', r.cno || '', `${r.tt} — ${r.cno || ''} (histórico, ${r.n} expediente(s))`, 'reconstruccion@' + req.user.email]);
+      await agregarBitacora('PRES-' + codigo, req.user.email, 'creacion',
+        `Presupuesto reconstruido desde el registro histórico: referenciado por ${r.n} expediente(s) de ${r.tt}. Estado asignado: Aceptado (trabajo ejecutado).`);
+      creados++;
+    }
+    await logAdmin(req.user.email, 'importacion_presupuestos', `${creados} reconstruidos, ${saltados} ya existían`);
+    programarEspejo();
+    res.json({ ok: true, creados, saltados });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/documentos/:codigo/estado', auth(['admin', 'editor']), async (req, res) => {
   try {
     const { estado } = req.body || {};
