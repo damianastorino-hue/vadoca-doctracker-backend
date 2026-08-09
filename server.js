@@ -465,6 +465,46 @@ app.post('/api/expedientes/:id/corregir', auth(['admin', 'editor']), async (req,
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Reasignación controlada del número de expediente (solo admin, con motivo y trazabilidad total) */
+app.post('/api/expedientes/:id/reasignar', auth(['admin']), async (req, res) => {
+  try {
+    const { nuevoNumero, motivo } = req.body || {};
+    if (!motivo || !motivo.trim()) return res.status(400).json({ error: 'El motivo es obligatorio' });
+    const nuevo = String(parseInt(nuevoNumero, 10)).padStart(3, '0');
+    if (isNaN(parseInt(nuevoNumero, 10))) return res.status(400).json({ error: 'Número nuevo inválido' });
+    const docs = (await pool.query('SELECT * FROM documentos WHERE expediente_id=$1', [req.params.id])).rows;
+    if (!docs.length) return res.status(404).json({ error: 'Expediente no encontrado' });
+    const d0 = docs[0];
+    const partes = req.params.id.split('-'); // TT-CLIENTE-NUM
+    const tt = partes[0], cliente = partes[1], viejo = partes[2];
+    if (nuevo === viejo) return res.status(400).json({ error: 'El número nuevo es igual al actual' });
+    const expNuevo = `${tt}-${cliente}-${nuevo}`;
+    const ocupado = await pool.query('SELECT 1 FROM documentos WHERE expediente_id=$1 LIMIT 1', [expNuevo]);
+    if (ocupado.rowCount) return res.status(400).json({ error: `El número ${nuevo} ya está ocupado (${expNuevo})` });
+    // Actualizar códigos de todos los documentos preservando su formato original
+    const re = new RegExp(`-${cliente}-${viejo}(/)`);
+    for (const d of docs) {
+      const codNuevo = d.codigo.replace(re, `-${cliente}-${nuevo}$1`);
+      await pool.query('UPDATE documentos SET codigo=$1, doc_num=$2, expediente_id=$3, ultimo_movimiento=now() WHERE id=$4',
+        [codNuevo, nuevo, expNuevo, d.id]);
+    }
+    // Migrar la bitácora al código nuevo (la cadena de hashes no depende del código: la integridad se preserva)
+    await pool.query('UPDATE bitacora SET expediente_id=$1 WHERE expediente_id=$2', [expNuevo, req.params.id]);
+    // Renombrar la carpeta de Drive si existe
+    if (d0.carpeta_drive_id) {
+      try {
+        const drive = await driveCli();
+        await drive.files.update({ fileId: d0.carpeta_drive_id, requestBody: { name: limpiar(`${expNuevo} - ${d0.descripcion}`) } });
+      } catch (e) { /* si falla el renombre, el registro queda igual correcto */ }
+    }
+    await agregarBitacora(expNuevo, req.user.email, 'correccion',
+      `REASIGNACIÓN DE CÓDIGO DE EXPEDIENTE: ${req.params.id} → ${expNuevo}. Documentos: ${docs.map(d => d.codigo.replace(re, `-${cliente}-${nuevo}$1`)).join(', ')}. Motivo: ${motivo.trim()}.`);
+    await logAdmin(req.user.email, 'reasignacion_expediente', `${req.params.id} → ${expNuevo}`);
+    programarEspejo();
+    res.json({ ok: true, expediente: expNuevo });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* Reconstrucción de presupuestos históricos desde las referencias del registro */
 app.post('/api/presupuestos/importar-desde-registro', auth(['admin']), async (req, res) => {
   try {
