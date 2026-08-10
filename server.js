@@ -505,6 +505,34 @@ app.post('/api/expedientes/:id/reasignar', auth(['admin']), async (req, res) => 
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Importación masiva de presupuestos (completa la serie con rechazados/vencidos/sin respuesta) */
+app.post('/api/presupuestos/importar', auth(['admin']), async (req, res) => {
+  try {
+    const { filas } = req.body || {};
+    if (!Array.isArray(filas) || !filas.length) return res.status(400).json({ error: 'No hay filas para importar' });
+    let importados = 0, saltados = 0; const errores = [];
+    for (const f of filas) {
+      try {
+        const codigo = String(f.codigo || '').padStart(4, '0');
+        if (!/^\d{4}$/.test(codigo) || !f.descripcion) throw new Error('faltan código o descripción');
+        const existe = await pool.query('SELECT 1 FROM presupuestos WHERE codigo=$1', [codigo]);
+        if (existe.rowCount) { saltados++; continue; }
+        const est = ['Borrador', 'Enviado', 'Aceptado', 'Rechazado', 'Vencido'].includes(f.estado) ? f.estado : 'Enviado';
+        await pool.query(`INSERT INTO presupuestos(codigo,cliente_num,cliente_nombre,descripcion,monto,moneda,fecha_emision,estado,autor,ultimo_movimiento)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now())`,
+          [codigo, f.cliente || '', f.clienteNombre || '', String(f.descripcion).trim().slice(0, 200),
+           f.monto || null, f.moneda || 'ARS', f.fecha_emision || null, est, 'importacion@' + req.user.email]);
+        await agregarBitacora('PRES-' + codigo, req.user.email, 'creacion',
+          `Presupuesto importado de la planilla histórica: ${f.descripcion}. Estado: ${est}.${f.monto ? ' Cotización: ' + (f.moneda || 'ARS') + ' ' + f.monto + '.' : ''}`);
+        importados++;
+      } catch (err) { errores.push((f.codigo || '?') + ': ' + err.message); }
+    }
+    await logAdmin(req.user.email, 'importacion_presupuestos_masiva', `${importados} importados, ${saltados} ya existían, ${errores.length} con error`);
+    programarEspejo();
+    res.json({ ok: true, importados, saltados, errores });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* Reconstrucción de presupuestos históricos desde las referencias del registro */
 app.post('/api/presupuestos/importar-desde-registro', auth(['admin']), async (req, res) => {
   try {
