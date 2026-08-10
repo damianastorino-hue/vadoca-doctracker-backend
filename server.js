@@ -862,6 +862,64 @@ app.post('/api/presupuestos', auth(['admin']), async (req, res) => {
     res.json({ ok: true, codigo });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+/* Importación masiva de presupuestos históricos (crea faltantes y completa reconstruidos) */
+app.post('/api/presupuestos/importar', auth(['admin']), async (req, res) => {
+  try {
+    const { filas } = req.body || {};
+    if (!Array.isArray(filas) || !filas.length) return res.status(400).json({ error: 'No hay filas para importar' });
+    let creados = 0, actualizados = 0, saltados = 0; const errores = [];
+    for (const f of filas) {
+      try {
+        const codigo = String(f.codigo).replace(/\D/g, '').padStart(4, '0');
+        if (!codigo || !f.descripcion) throw new Error('faltan código o descripción');
+        const estado = ['Borrador', 'Enviado', 'Aceptado', 'Rechazado', 'Vencido'].includes(f.estado) ? f.estado : 'Aceptado';
+        const ex = (await pool.query('SELECT * FROM presupuestos WHERE codigo=$1', [codigo])).rows[0];
+        if (ex && !String(ex.autor || '').startsWith('reconstruccion@')) { saltados++; continue; }
+        if (ex) {
+          await pool.query(`UPDATE presupuestos SET cliente_num=$1, cliente_nombre=$2, descripcion=$3, monto=$4, moneda=$5, fecha_emision=$6, estado=$7, ultimo_movimiento=now() WHERE codigo=$8`,
+            [f.cliente || ex.cliente_num, f.clienteNombre || ex.cliente_nombre, f.descripcion, f.monto || null, f.moneda || 'ARS', f.fecha || ex.fecha_emision, estado, codigo]);
+          await agregarBitacora('PRES-' + codigo, req.user.email, 'correccion', `Datos completados desde la planilla histórica: "${f.descripcion}"${f.monto ? ', ' + (f.moneda || 'ARS') + ' ' + f.monto : ''}, estado ${estado}.`);
+          actualizados++;
+        } else {
+          await pool.query(`INSERT INTO presupuestos(codigo,cliente_num,cliente_nombre,descripcion,monto,moneda,fecha_emision,estado,autor,ultimo_movimiento)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,now())`,
+            [codigo, f.cliente || '', f.clienteNombre || '', f.descripcion, f.monto || null, f.moneda || 'ARS', f.fecha || '', estado, 'importacion@' + req.user.email]);
+          await agregarBitacora('PRES-' + codigo, req.user.email, 'creacion', `Presupuesto importado de la planilla histórica — ${f.descripcion}. Estado: ${estado}.`);
+          creados++;
+        }
+      } catch (err) { errores.push((f.codigo || '?') + ': ' + err.message); }
+    }
+    await logAdmin(req.user.email, 'importacion_presupuestos_masiva', `${creados} creados, ${actualizados} completados, ${saltados} sin cambios`);
+    programarEspejo();
+    res.json({ ok: true, creados, actualizados, saltados, errores });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* Edición de datos del presupuesto (bitácora con antes→después) */
+app.post('/api/presupuestos/:codigo/corregir', auth(['admin']), async (req, res) => {
+  try {
+    const { cliente, clienteNombre, descripcion, monto, moneda, fecha_emision, motivo } = req.body || {};
+    const p = (await pool.query('SELECT * FROM presupuestos WHERE codigo=$1', [req.params.codigo])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+    const cambios = [];
+    if (descripcion !== undefined && descripcion !== p.descripcion) cambios.push(`Descripción: "${p.descripcion}" → "${descripcion}"`);
+    if (cliente !== undefined && cliente !== p.cliente_num) cambios.push(`Cliente: "${p.cliente_nombre || p.cliente_num || '—'}" → "${clienteNombre || cliente}"`);
+    const montoNuevo = monto === '' || monto === null || monto === undefined ? null : Number(monto);
+    const montoViejo = p.monto === null ? null : Number(p.monto);
+    if (monto !== undefined && montoNuevo !== montoViejo) cambios.push(`Monto: ${montoViejo ?? '—'} → ${montoNuevo ?? '—'}`);
+    if (moneda !== undefined && moneda !== p.moneda) cambios.push(`Moneda: ${p.moneda || '—'} → ${moneda}`);
+    if (fecha_emision !== undefined && fecha_emision !== (p.fecha_emision || '')) cambios.push(`Fecha de emisión: ${p.fecha_emision || '—'} → ${fecha_emision || '—'}`);
+    if (!cambios.length) return res.status(400).json({ error: 'No hay cambios para aplicar' });
+    await pool.query(`UPDATE presupuestos SET cliente_num=COALESCE($1,cliente_num), cliente_nombre=COALESCE($2,cliente_nombre),
+      descripcion=COALESCE($3,descripcion), monto=$4, moneda=COALESCE($5,moneda), fecha_emision=COALESCE($6,fecha_emision), ultimo_movimiento=now() WHERE codigo=$7`,
+      [cliente, clienteNombre, descripcion, montoNuevo, moneda, fecha_emision, req.params.codigo]);
+    await agregarBitacora('PRES-' + req.params.codigo, req.user.email, 'correccion',
+      `Datos del presupuesto actualizados${motivo ? '. Motivo: ' + motivo.trim() : ''}. Cambios: ${cambios.join(' | ')}.`);
+    programarEspejo();
+    res.json({ ok: true, cambios });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/presupuestos/:codigo/estado', auth(['admin']), async (req, res) => {
   try {
     const { estado } = req.body || {};
