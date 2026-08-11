@@ -143,6 +143,13 @@ CREATE TABLE IF NOT EXISTS poe_relaciones (
   relacionado TEXT NOT NULL,
   UNIQUE(base, relacionado)
 );
+CREATE TABLE IF NOT EXISTS accesos (
+  id SERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  email TEXT NOT NULL,
+  evento TEXT NOT NULL,
+  detalle TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS admin_log (
   id SERIAL PRIMARY KEY,
   ts TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -220,8 +227,12 @@ app.post('/api/login', async (req, res) => {
   const { email, password } = req.body || {};
   const r = await pool.query('SELECT * FROM usuarios WHERE email=$1', [(email || '').toLowerCase().trim()]);
   const u = r.rows[0];
-  if (!u || !u.activo || !bcrypt.compareSync(password || '', u.hash))
+  if (!u || !u.activo || !bcrypt.compareSync(password || '', u.hash)) {
+    await pool.query('INSERT INTO accesos(email,evento,detalle) VALUES($1,$2,$3)',
+      [(email || '').toLowerCase().trim() || '(vacío)', 'login_fallido', !u ? 'usuario inexistente' : (!u.activo ? 'usuario inactivo' : 'contraseña incorrecta')]).catch(() => {});
     return res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+  }
+  await pool.query('INSERT INTO accesos(email,evento,detalle) VALUES($1,$2,$3)', [u.email, 'login_ok', 'rol: ' + u.rol]).catch(() => {});
   res.json({ token: firmar(u), usuario: { email: u.email, nombre: u.nombre, rol: u.rol, debe_cambiar_clave: u.debe_cambiar_clave } });
 });
 
@@ -1058,6 +1069,75 @@ app.post('/api/proyectos/:codigo/notas', auth(['admin', 'editor']), upload.array
     const entrada = await agregarBitacora(cod, req.user.email, adjuntos.length ? 'archivo' : 'nota', texto || `Se subieron ${adjuntos.length} archivo(s)`, adjuntos);
     await pool.query('UPDATE proyectos SET ultimo_movimiento=now() WHERE codigo=$1', [cod]);
     res.json({ ok: true, entrada });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================================================
+   AUDITORÍA GLOBAL E INDICADORES
+   ============================================================ */
+app.get('/api/auditoria', auth(['admin']), async (req, res) => {
+  try {
+    const { modulo, autor, q, desde, hasta } = req.query || {};
+    const params = []; let where = [];
+    const filtro = (campo, val, op) => { params.push(val); return `${campo} ${op} $${params.length}`; };
+    let base = `
+      SELECT ts, autor, tipo, clave, texto, fuente, modulo FROM (
+        SELECT b.ts, b.autor, b.tipo, b.expediente_id clave, b.texto, 'bitacora' fuente,
+          CASE WHEN b.expediente_id LIKE 'PRES-%' THEN 'Presupuestos'
+               WHEN b.expediente_id LIKE 'PRJ-%' THEN 'Proyectos'
+               WHEN EXISTS (SELECT 1 FROM procedimientos p WHERE p.codigo_base=b.expediente_id) THEN 'Procedimientos'
+               ELSE 'Expedientes' END modulo
+        FROM bitacora b
+        UNION ALL
+        SELECT a.ts, a.autor, a.accion tipo, 'ADMINISTRACIÓN' clave, a.detalle texto, 'admin' fuente, 'Administración' modulo FROM admin_log a
+        UNION ALL
+        SELECT x.ts, x.email autor, x.evento tipo, 'ACCESOS' clave, x.detalle texto, 'acceso' fuente, 'Accesos' modulo FROM accesos x
+      ) t`;
+    if (modulo) where.push(filtro('modulo', modulo, '='));
+    if (autor) where.push(filtro('autor', '%' + autor + '%', 'ILIKE'));
+    if (q) { params.push('%' + q + '%'); where.push(`(texto ILIKE $${params.length} OR clave ILIKE $${params.length})`); }
+    if (desde) where.push(filtro('ts', desde, '>='));
+    if (hasta) where.push(filtro('ts', hasta + 'T23:59:59', '<='));
+    if (where.length) base += ' WHERE ' + where.join(' AND ');
+    base += ' ORDER BY ts DESC LIMIT 500';
+    res.json((await pool.query(base, params)).rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/indicadores', auth(), async (req, res) => {
+  try {
+    const hoy = new Date(), anio = hoy.toISOString().slice(0, 4), mes = hoy.toISOString().slice(0, 7);
+    const FINALES = ['Entregado', 'Cancelado'];
+    const [docsMes, docsAnio, serie12, porTipo, ciclo, exps, poes, proys, docsPorProy] = await Promise.all([
+      pool.query("SELECT COUNT(*) n FROM documentos WHERE fecha_alta LIKE $1", [mes + '%']),
+      pool.query("SELECT COUNT(*) n FROM documentos WHERE fecha_alta LIKE $1", [anio + '%']),
+      pool.query("SELECT SUBSTRING(fecha_alta,1,7) m, COUNT(*) n FROM documentos WHERE fecha_alta >= $1 GROUP BY 1 ORDER BY 1", [new Date(hoy.getFullYear(), hoy.getMonth() - 11, 1).toISOString().slice(0, 10)]),
+      pool.query("SELECT tipo_doc t, COUNT(*) n FROM documentos WHERE fecha_alta LIKE $1 GROUP BY 1 ORDER BY n DESC", [anio + '%']),
+      pool.query("SELECT ROUND(AVG(fecha_fin::date - fecha_alta::date),1) d, COUNT(*) n FROM documentos WHERE fecha_fin IS NOT NULL AND fecha_fin <> '' AND fecha_alta IS NOT NULL AND fecha_alta <> ''"),
+      pool.query(`SELECT COUNT(DISTINCT expediente_id) FILTER (WHERE estado NOT IN ('Entregado','Cancelado')) activos,
+                         COUNT(DISTINCT expediente_id) FILTER (WHERE estado NOT IN ('Entregado','Cancelado') AND ultimo_movimiento < now() - interval '7 days') estancados,
+                         COUNT(DISTINCT expediente_id) total FROM documentos`),
+      pool.query(`SELECT COUNT(*) FILTER (WHERE estado='Vigente') vigentes,
+                         COUNT(*) FILTER (WHERE estado='Vigente' AND fecha_vencimiento <> '' AND fecha_vencimiento::date <= (now() + interval '30 days')::date) por_vencer,
+                         COUNT(*) FILTER (WHERE estado='Vigente' AND fecha_vencimiento <> '' AND fecha_vencimiento::date < now()::date) vencidos,
+                         COUNT(*) FILTER (WHERE estado='Borrador') borradores FROM procedimientos`),
+      pool.query(`SELECT COUNT(*) total, COUNT(*) FILTER (WHERE estado='Activo') activos, COUNT(*) FILTER (WHERE estado='Cerrado') cerrados FROM proyectos`),
+      pool.query(`SELECT ROUND(AVG(n),1) prom FROM (SELECT proyecto, COUNT(*) n FROM documentos WHERE proyecto <> '' GROUP BY proyecto) s`)
+    ]);
+    const out = {
+      docs: { mes: +docsMes.rows[0].n, anio: +docsAnio.rows[0].n, serie12: serie12.rows, porTipo: porTipo.rows,
+              cicloPromedioDias: ciclo.rows[0].d ? +ciclo.rows[0].d : null, cicloMuestra: +ciclo.rows[0].n },
+      expedientes: exps.rows[0], poes: poes.rows[0],
+      proyectos: { ...proys.rows[0], promDocsPorProyecto: docsPorProy.rows[0].prom ? +docsPorProy.rows[0].prom : null }
+    };
+    if (req.user.rol === 'admin') {
+      const pr = await pool.query(`SELECT COUNT(*) FILTER (WHERE estado <> 'Borrador') emitidos,
+        COUNT(*) FILTER (WHERE estado='Aceptado') aceptados, COUNT(*) FILTER (WHERE estado='Enviado') pipeline,
+        COUNT(*) FILTER (WHERE estado='Rechazado') rechazados, COUNT(*) FILTER (WHERE estado='Vencido') vencidos FROM presupuestos`);
+      const m = await pool.query(`SELECT moneda, SUM(monto) t FROM presupuestos WHERE estado='Aceptado' AND monto IS NOT NULL AND fecha_emision LIKE $1 GROUP BY moneda`, [anio + '%']);
+      out.comercial = { ...pr.rows[0], montosAceptadosAnio: m.rows };
+    }
+    res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
