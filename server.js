@@ -165,6 +165,41 @@ async function boot() {
   await pool.query(SCHEMA);
   await pool.query("ALTER TABLE procedimientos ADD COLUMN IF NOT EXISTS sector TEXT NOT NULL DEFAULT ''");
   await pool.query("ALTER TABLE documentos ADD COLUMN IF NOT EXISTS proyecto TEXT NOT NULL DEFAULT ''");
+  // --- Módulo Seguimiento (FARO) ---
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS seg_templates (
+      id SERIAL PRIMARY KEY,
+      nombre TEXT NOT NULL,
+      items JSONB NOT NULL DEFAULT '[]',
+      creado TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS seg_items (
+      id SERIAL PRIMARY KEY,
+      proyecto TEXT NOT NULL,
+      nombre TEXT NOT NULL,
+      orden INT NOT NULL DEFAULT 0,
+      estado TEXT NOT NULL DEFAULT 'pendiente',
+      doc_codigo TEXT,
+      fecha_limite TEXT,
+      notas TEXT NOT NULL DEFAULT '',
+      creado TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_seg_proy ON seg_items(proyecto);
+  `);
+  const segT = await pool.query('SELECT COUNT(*)::int n FROM seg_templates');
+  if (!segT.rows[0].n) {
+    const pack = (extra) => ['Plan Maestro', 'RU', 'Protocolo DQ', 'Informe DQ', 'Protocolo IQ', 'Informe IQ',
+      'Protocolo OQ', 'Informe OQ', 'Protocolo PQ', 'Informe PQ', ...extra, 'Informe Final'];
+    const seeds = [
+      ['Validación de planilla de cálculo', pack(['Protocolo IV', 'Informe IV'])],
+      ['Calificación de equipo', pack([])],
+      ['Calificación de software', pack([])],
+      ['Presupuesto / Comercial', ['Relevamiento', 'Presupuesto', 'Seguimiento post-envío', 'Cierre (OC / aceptación)']],
+      ['Proyecto libre', []]
+    ];
+    for (const [n, its] of seeds) await pool.query('INSERT INTO seg_templates(nombre,items) VALUES($1,$2)', [n, JSON.stringify(its)]);
+    console.log('Seguimiento: templates seed cargados');
+  }
   // Superusuario inicial
   if (ADMIN_EMAIL && ADMIN_PASSWORD) {
     const r = await pool.query('SELECT 1 FROM usuarios WHERE email=$1', [ADMIN_EMAIL.toLowerCase()]);
@@ -1138,6 +1173,145 @@ app.get('/api/indicadores', auth(), async (req, res) => {
       out.comercial = { ...pr.rows[0], montosAceptadosAnio: m.rows };
     }
     res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================================================
+   MÓDULO SEGUIMIENTO (FARO) — checklist templado por proyecto
+   Ítems vinculables a documentos reales: en ese caso el estado
+   del documento manda (fuente única). Eventos → bitácora del
+   proyecto (misma cadena de hashes).
+   ============================================================ */
+
+// Todo el estado del módulo en un solo fetch
+app.get('/api/seguimiento/data', auth(), async (_req, res) => {
+  try {
+    const proyectos = (await pool.query('SELECT * FROM proyectos ORDER BY creado DESC')).rows;
+    const items = (await pool.query(`
+      SELECT s.*, d.estado AS doc_estado, d.descripcion AS doc_descripcion, d.expediente_id AS doc_expediente
+      FROM seg_items s LEFT JOIN documentos d ON d.codigo = s.doc_codigo
+      ORDER BY s.orden, s.id`)).rows;
+    const templates = (await pool.query('SELECT * FROM seg_templates ORDER BY id')).rows;
+    const documentos = (await pool.query(
+      "SELECT codigo, proyecto, expediente_id, estado, tipo_doc, prot_inf, descripcion FROM documentos ORDER BY codigo")).rows;
+    res.json({ proyectos, items, templates, documentos });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Aplicar un template sobre un proyecto existente
+app.post('/api/seguimiento/aplicar-template', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { proyecto, template_id } = req.body || {};
+    const p = (await pool.query('SELECT codigo FROM proyectos WHERE codigo=$1', [proyecto])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Proyecto inexistente' });
+    const t = (await pool.query('SELECT * FROM seg_templates WHERE id=$1', [template_id])).rows[0];
+    if (!t) return res.status(404).json({ error: 'Template inexistente' });
+    const base = (await pool.query('SELECT COALESCE(MAX(orden),-1)+1 o FROM seg_items WHERE proyecto=$1', [proyecto])).rows[0].o;
+    let orden = base;
+    for (const nombre of t.items)
+      await pool.query('INSERT INTO seg_items(proyecto,nombre,orden) VALUES($1,$2,$3)', [proyecto, nombre, orden++]);
+    await agregarBitacora(proyecto, req.user.email, 'seguimiento', `Template aplicado: ${t.nombre} (${t.items.length} ítems)`);
+    res.json({ ok: true, agregados: t.items.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Crear ítem suelto
+app.post('/api/seguimiento/items', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { proyecto, nombre, fecha_limite, doc_codigo } = req.body || {};
+    if (!proyecto || !nombre) return res.status(400).json({ error: 'Faltan proyecto o nombre' });
+    const o = (await pool.query('SELECT COALESCE(MAX(orden),-1)+1 o FROM seg_items WHERE proyecto=$1', [proyecto])).rows[0].o;
+    const r = await pool.query(
+      'INSERT INTO seg_items(proyecto,nombre,orden,fecha_limite,doc_codigo) VALUES($1,$2,$3,$4,$5) RETURNING *',
+      [proyecto, nombre, o, fecha_limite || null, doc_codigo || null]);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Editar ítem. Si está vinculado a un documento y viene "estado",
+// el cambio se aplica AL DOCUMENTO (con su bitácora), no al ítem.
+app.patch('/api/seguimiento/items/:id', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const it = (await pool.query('SELECT * FROM seg_items WHERE id=$1', [req.params.id])).rows[0];
+    if (!it) return res.status(404).json({ error: 'Ítem inexistente' });
+    const b = req.body || {};
+
+    if (b.estado !== undefined && it.doc_codigo) {
+      const r = await pool.query(
+        `UPDATE documentos SET estado=$1, ultimo_movimiento=now(),
+         fecha_fin=CASE WHEN $1='Entregado' THEN $2 ELSE fecha_fin END
+         WHERE codigo=$3 RETURNING expediente_id`,
+        [b.estado, ahora().slice(0, 10), it.doc_codigo]);
+      if (r.rowCount)
+        await agregarBitacora(r.rows[0].expediente_id, req.user.email, 'estado', `${it.doc_codigo} → estado: ${b.estado} (desde Seguimiento)`);
+      delete b.estado;
+    }
+
+    const campos = ['nombre', 'estado', 'fecha_limite', 'notas', 'orden', 'doc_codigo'];
+    const sets = [], vals = [];
+    for (const c of campos) if (b[c] !== undefined) { vals.push(b[c] === '' ? null : b[c]); sets.push(`${c}=$${vals.length}`); }
+    if (sets.length) {
+      vals.push(req.params.id);
+      await pool.query(`UPDATE seg_items SET ${sets.join(',')} WHERE id=$${vals.length}`, vals);
+      if (b.estado !== undefined && b.estado !== it.estado)
+        await agregarBitacora(it.proyecto, req.user.email, 'seguimiento', `${it.nombre}: ${it.estado} → ${b.estado}`);
+    }
+    const out = (await pool.query(`
+      SELECT s.*, d.estado AS doc_estado, d.descripcion AS doc_descripcion, d.expediente_id AS doc_expediente
+      FROM seg_items s LEFT JOIN documentos d ON d.codigo = s.doc_codigo WHERE s.id=$1`, [req.params.id])).rows[0];
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/seguimiento/items/:id', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const it = (await pool.query('DELETE FROM seg_items WHERE id=$1 RETURNING proyecto,nombre', [req.params.id])).rows[0];
+    if (it) await agregarBitacora(it.proyecto, req.user.email, 'seguimiento', `Ítem eliminado: ${it.nombre}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Nota manual sobre un ítem → bitácora del proyecto
+app.post('/api/seguimiento/items/:id/nota', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const it = (await pool.query('SELECT * FROM seg_items WHERE id=$1', [req.params.id])).rows[0];
+    if (!it) return res.status(404).json({ error: 'Ítem inexistente' });
+    const texto = (req.body && req.body.texto || '').trim();
+    if (!texto) return res.status(400).json({ error: 'Nota vacía' });
+    const e = await agregarBitacora(it.proyecto, req.user.email, 'seguimiento', `[${it.nombre}] ${texto}`);
+    res.json(e);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Bitácora del proyecto (incluye entradas de seguimiento)
+app.get('/api/seguimiento/proyectos/:codigo/bitacora', auth(), async (req, res) => {
+  try {
+    const r = await pool.query('SELECT ts,autor,tipo,texto FROM bitacora WHERE expediente_id=$1 ORDER BY id DESC LIMIT 200', [req.params.codigo]);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Templates CRUD
+app.post('/api/seguimiento/templates', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { nombre, items } = req.body || {};
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
+    const r = await pool.query('INSERT INTO seg_templates(nombre,items) VALUES($1,$2) RETURNING *', [nombre, JSON.stringify(items || [])]);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/seguimiento/templates/:id', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { nombre, items } = req.body || {};
+    const r = await pool.query('UPDATE seg_templates SET nombre=COALESCE($1,nombre), items=COALESCE($2,items) WHERE id=$3 RETURNING *',
+      [nombre || null, items ? JSON.stringify(items) : null, req.params.id]);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/seguimiento/templates/:id', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    await pool.query('DELETE FROM seg_templates WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
