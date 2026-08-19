@@ -185,6 +185,16 @@ async function boot() {
       creado TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS idx_seg_proy ON seg_items(proyecto);
+    CREATE TABLE IF NOT EXISTS seg_proyectos (
+      id SERIAL PRIMARY KEY,
+      codigo TEXT UNIQUE,
+      nombre TEXT NOT NULL,
+      ambito TEXT NOT NULL DEFAULT 'personal',
+      cliente TEXT NOT NULL DEFAULT '',
+      estado TEXT NOT NULL DEFAULT 'Activo',
+      notas TEXT NOT NULL DEFAULT '',
+      creado TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
   `);
   const segT = await pool.query('SELECT COUNT(*)::int n FROM seg_templates');
   if (!segT.rows[0].n) {
@@ -1187,6 +1197,7 @@ app.get('/api/indicadores', auth(), async (req, res) => {
 app.get('/api/seguimiento/data', auth(), async (_req, res) => {
   try {
     const proyectos = (await pool.query('SELECT * FROM proyectos ORDER BY creado DESC')).rows;
+    const proyectos_faro = (await pool.query('SELECT * FROM seg_proyectos ORDER BY creado DESC')).rows;
     const items = (await pool.query(`
       SELECT s.*, d.estado AS doc_estado, d.descripcion AS doc_descripcion, d.expediente_id AS doc_expediente
       FROM seg_items s LEFT JOIN documentos d ON d.codigo = s.doc_codigo
@@ -1194,7 +1205,47 @@ app.get('/api/seguimiento/data', auth(), async (_req, res) => {
     const templates = (await pool.query('SELECT * FROM seg_templates ORDER BY id')).rows;
     const documentos = (await pool.query(
       "SELECT codigo, proyecto, expediente_id, estado, tipo_doc, prot_inf, descripcion FROM documentos ORDER BY codigo")).rows;
-    res.json({ proyectos, items, templates, documentos });
+    res.json({ proyectos, proyectos_faro, items, templates, documentos });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Proyectos propios de FARO (personales o profesionales fuera de DocTracker)
+app.post('/api/seguimiento/proyectos', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { nombre, ambito, cliente, notas } = req.body || {};
+    if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
+    const amb = ['profesional', 'personal'].includes(ambito) ? ambito : 'personal';
+    const r = await pool.query('INSERT INTO seg_proyectos(nombre,ambito,cliente,notas) VALUES($1,$2,$3,$4) RETURNING *',
+      [nombre, amb, cliente || '', notas || '']);
+    const p = r.rows[0];
+    const codigo = 'F-' + String(p.id).padStart(3, '0');
+    await pool.query('UPDATE seg_proyectos SET codigo=$1 WHERE id=$2', [codigo, p.id]);
+    p.codigo = codigo;
+    await agregarBitacora(codigo, req.user.email, 'seguimiento', `Proyecto FARO creado: ${nombre} (${amb})`);
+    res.json(p);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/seguimiento/proyectos/:codigo', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const b = req.body || {};
+    const campos = ['nombre', 'ambito', 'cliente', 'estado', 'notas'];
+    const sets = [], vals = [];
+    for (const c of campos) if (b[c] !== undefined) { vals.push(b[c]); sets.push(`${c}=$${vals.length}`); }
+    if (!sets.length) return res.status(400).json({ error: 'Nada que actualizar' });
+    vals.push(req.params.codigo);
+    const r = await pool.query(`UPDATE seg_proyectos SET ${sets.join(',')} WHERE codigo=$${vals.length} RETURNING *`, vals);
+    if (!r.rowCount) return res.status(404).json({ error: 'Proyecto FARO inexistente' });
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/seguimiento/proyectos/:codigo', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const r = await pool.query('DELETE FROM seg_proyectos WHERE codigo=$1 RETURNING nombre', [req.params.codigo]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Proyecto FARO inexistente' });
+    await pool.query('DELETE FROM seg_items WHERE proyecto=$1', [req.params.codigo]);
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1202,8 +1253,9 @@ app.get('/api/seguimiento/data', auth(), async (_req, res) => {
 app.post('/api/seguimiento/aplicar-template', auth(['admin', 'editor']), async (req, res) => {
   try {
     const { proyecto, template_id } = req.body || {};
-    const p = (await pool.query('SELECT codigo FROM proyectos WHERE codigo=$1', [proyecto])).rows[0];
-    if (!p) return res.status(404).json({ error: 'Proyecto inexistente' });
+    const enDT = (await pool.query('SELECT codigo FROM proyectos WHERE codigo=$1', [proyecto])).rowCount;
+    const enFaro = (await pool.query('SELECT codigo FROM seg_proyectos WHERE codigo=$1', [proyecto])).rowCount;
+    if (!enDT && !enFaro) return res.status(404).json({ error: 'Proyecto inexistente' });
     const t = (await pool.query('SELECT * FROM seg_templates WHERE id=$1', [template_id])).rows[0];
     if (!t) return res.status(404).json({ error: 'Template inexistente' });
     const base = (await pool.query('SELECT COALESCE(MAX(orden),-1)+1 o FROM seg_items WHERE proyecto=$1', [proyecto])).rows[0].o;
