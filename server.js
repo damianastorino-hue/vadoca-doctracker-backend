@@ -165,6 +165,7 @@ async function boot() {
   await pool.query(SCHEMA);
   await pool.query("ALTER TABLE procedimientos ADD COLUMN IF NOT EXISTS sector TEXT NOT NULL DEFAULT ''");
   await pool.query("ALTER TABLE documentos ADD COLUMN IF NOT EXISTS proyecto TEXT NOT NULL DEFAULT ''");
+  await pool.query("ALTER TABLE presupuestos ADD COLUMN IF NOT EXISTS facturacion TEXT NOT NULL DEFAULT 'Abierta'");
   // --- Módulo Seguimiento (FARO) ---
   await pool.query(`
     CREATE TABLE IF NOT EXISTS seg_templates (
@@ -192,6 +193,19 @@ async function boot() {
       ambito TEXT NOT NULL DEFAULT 'personal',
       cliente TEXT NOT NULL DEFAULT '',
       estado TEXT NOT NULL DEFAULT 'Activo',
+      notas TEXT NOT NULL DEFAULT '',
+      creado TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS facturas (
+      id SERIAL PRIMARY KEY,
+      numero TEXT NOT NULL,
+      cliente TEXT NOT NULL DEFAULT '',
+      presupuesto TEXT NOT NULL DEFAULT '',
+      fecha_emision TEXT NOT NULL,
+      monto NUMERIC NOT NULL DEFAULT 0,
+      moneda TEXT NOT NULL DEFAULT 'ARS',
+      estado TEXT NOT NULL DEFAULT 'Emitida',
+      fecha_cobro TEXT,
       notas TEXT NOT NULL DEFAULT '',
       creado TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -1205,7 +1219,10 @@ app.get('/api/seguimiento/data', auth(), async (_req, res) => {
     const templates = (await pool.query('SELECT * FROM seg_templates ORDER BY id')).rows;
     const documentos = (await pool.query(
       "SELECT codigo, proyecto, expediente_id, estado, tipo_doc, prot_inf, descripcion FROM documentos ORDER BY codigo")).rows;
-    res.json({ proyectos, proyectos_faro, items, templates, documentos });
+    const facturas = (await pool.query('SELECT * FROM facturas ORDER BY fecha_emision DESC, id DESC')).rows;
+    const presupuestos = (await pool.query(
+      "SELECT codigo, cliente_nombre, descripcion, monto, moneda, estado, facturacion FROM presupuestos ORDER BY codigo DESC")).rows;
+    res.json({ proyectos, proyectos_faro, items, templates, documentos, facturas, presupuestos });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1340,6 +1357,60 @@ app.get('/api/seguimiento/proyectos/:codigo/bitacora', auth(), async (req, res) 
   try {
     const r = await pool.query('SELECT ts,autor,tipo,texto FROM bitacora WHERE expediente_id=$1 ORDER BY id DESC LIMIT 200', [req.params.codigo]);
     res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ---------- Facturas ----------
+app.post('/api/seguimiento/facturas', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const { numero, cliente, presupuesto, fecha_emision, monto, moneda, notas } = req.body || {};
+    if (!numero || !fecha_emision) return res.status(400).json({ error: 'Faltan número o fecha de emisión' });
+    const r = await pool.query(
+      `INSERT INTO facturas(numero,cliente,presupuesto,fecha_emision,monto,moneda,notas)
+       VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [numero, cliente || '', presupuesto || '', fecha_emision, monto || 0, moneda || 'ARS', notas || '']);
+    await agregarBitacora('__FACTURAS__', req.user.email, 'factura',
+      `Factura ${numero} emitida — ${cliente || 's/cliente'} · ${moneda || 'ARS'} ${monto || 0}${presupuesto ? ' · presup. ' + presupuesto : ''}`);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/seguimiento/facturas/:id', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const antes = (await pool.query('SELECT * FROM facturas WHERE id=$1', [req.params.id])).rows[0];
+    if (!antes) return res.status(404).json({ error: 'Factura inexistente' });
+    const b = req.body || {};
+    const campos = ['numero', 'cliente', 'presupuesto', 'fecha_emision', 'monto', 'moneda', 'estado', 'fecha_cobro', 'notas'];
+    const sets = [], vals = [];
+    for (const c of campos) if (b[c] !== undefined) { vals.push(b[c] === '' && c === 'fecha_cobro' ? null : b[c]); sets.push(`${c}=$${vals.length}`); }
+    if (!sets.length) return res.status(400).json({ error: 'Nada que actualizar' });
+    vals.push(req.params.id);
+    const r = await pool.query(`UPDATE facturas SET ${sets.join(',')} WHERE id=$${vals.length} RETURNING *`, vals);
+    if (b.estado === 'Cobrada' && antes.estado !== 'Cobrada')
+      await agregarBitacora('__FACTURAS__', req.user.email, 'factura',
+        `Factura ${antes.numero} COBRADA (${b.fecha_cobro || 'sin fecha'}) — ${antes.cliente} · ${antes.moneda} ${antes.monto}`);
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/seguimiento/facturas/:id', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const f = (await pool.query('DELETE FROM facturas WHERE id=$1 RETURNING numero,cliente', [req.params.id])).rows[0];
+    if (f) await agregarBitacora('__FACTURAS__', req.user.email, 'factura', `Factura ${f.numero} eliminada (${f.cliente})`);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cerrar / reabrir el ciclo de facturación de un presupuesto
+app.patch('/api/seguimiento/presupuestos/:codigo/facturacion', auth(['admin', 'editor']), async (req, res) => {
+  try {
+    const estado = (req.body || {}).estado;
+    if (!['Abierta', 'Cerrada'].includes(estado)) return res.status(400).json({ error: "Estado inválido (Abierta/Cerrada)" });
+    const r = await pool.query('UPDATE presupuestos SET facturacion=$1 WHERE codigo=$2 RETURNING codigo,cliente_nombre', [estado, req.params.codigo]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Presupuesto inexistente' });
+    await agregarBitacora('__FACTURAS__', req.user.email, 'factura',
+      `Ciclo de facturación del presupuesto ${req.params.codigo} ${estado === 'Cerrada' ? 'CERRADO' : 'reabierto'} (${r.rows[0].cliente_nombre || ''})`);
+    res.json({ ok: true, facturacion: estado });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
