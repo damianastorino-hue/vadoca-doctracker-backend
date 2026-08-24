@@ -1221,7 +1221,7 @@ app.get('/api/seguimiento/data', auth(), async (_req, res) => {
       "SELECT codigo, proyecto, expediente_id, estado, tipo_doc, prot_inf, descripcion FROM documentos ORDER BY codigo")).rows;
     const facturas = (await pool.query('SELECT * FROM facturas ORDER BY fecha_emision DESC, id DESC')).rows;
     const presupuestos = (await pool.query(
-      "SELECT codigo, cliente_nombre, descripcion, monto, moneda, estado, facturacion FROM presupuestos ORDER BY codigo DESC")).rows;
+      "SELECT codigo, cliente_nombre, descripcion, monto, moneda, estado, facturacion, fecha_emision, carpeta_drive_url FROM presupuestos ORDER BY codigo DESC")).rows;
     res.json({ proyectos, proyectos_faro, items, templates, documentos, facturas, presupuestos });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
