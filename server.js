@@ -474,8 +474,42 @@ app.get('/api/registro', auth(), async (_req, res) => {
   res.json(r.rows);
 });
 app.get('/api/expedientes/:id/bitacora', auth(), async (req, res) => {
-  const r = await pool.query('SELECT ts,autor,tipo,texto,adjuntos,prev_hash,hash FROM bitacora WHERE expediente_id=$1 ORDER BY id DESC', [req.params.id]);
+  const r = await pool.query('SELECT id,ts,autor,tipo,texto,adjuntos,prev_hash,hash FROM bitacora WHERE expediente_id=$1 ORDER BY id DESC', [req.params.id]);
   res.json(r.rows);
+});
+
+/* Anulación GxP de un adjunto: la entrada original NO se toca (cadena de hashes intacta).
+   Se agrega una entrada de anulación que la referencia, se renombra el archivo en Drive
+   como ANULADO_..., y el frontend bloquea el link. Reversible solo por bitácora manual. */
+app.post('/api/bitacora/anular-adjunto', auth(['admin']), async (req, res) => {
+  try {
+    const { entrada_id, drive_id, motivo, desvio } = req.body || {};
+    if (!entrada_id || !drive_id || !(motivo || '').trim())
+      return res.status(400).json({ error: 'Faltan entrada, archivo o motivo (obligatorio)' });
+    const ent = (await pool.query('SELECT * FROM bitacora WHERE id=$1', [entrada_id])).rows[0];
+    if (!ent) return res.status(404).json({ error: 'Entrada de bitácora inexistente' });
+    const adj = (ent.adjuntos || []).find(a => a.drive_id === drive_id);
+    if (!adj) return res.status(404).json({ error: 'El archivo no pertenece a esa entrada' });
+    const ya = await pool.query("SELECT 1 FROM bitacora WHERE tipo='anulacion' AND adjuntos @> $1::jsonb LIMIT 1",
+      [JSON.stringify([{ anula: drive_id }])]);
+    if (ya.rowCount) return res.status(400).json({ error: 'Ese adjunto ya está anulado' });
+
+    const nuevoNombre = 'ANULADO_' + ahora().slice(0, 10) + '_' + adj.nombre;
+    let renombrado = true;
+    try {
+      const drive = await driveCli();
+      await drive.files.update({ fileId: drive_id, requestBody: { name: nuevoNombre }, supportsAllDrives: true });
+    } catch (e) { renombrado = false; console.error('anular-adjunto rename:', e.message); }
+
+    const fechaEnt = new Date(ent.ts).toISOString().slice(0, 10);
+    const texto = `ADJUNTO ANULADO: "${adj.nombre}" (entrada #${ent.id} del ${fechaEnt}). Motivo: ${motivo.trim()}. ` +
+      (desvio && String(desvio).trim() ? `Desvío asociado: ${String(desvio).trim()}. ` : 'Desvío asociado: N/A. ') +
+      (renombrado ? `Archivo renombrado en Drive a "${nuevoNombre}".`
+                  : 'ATENCIÓN: no se pudo renombrar el archivo en Drive; anulado solo en bitácora.');
+    const entrada = await agregarBitacora(ent.expediente_id, req.user.email, 'anulacion', texto,
+      [{ anula: drive_id, original: adj.nombre, nombre: renombrado ? nuevoNombre : adj.nombre, entrada: ent.id }]);
+    res.json({ ok: true, entrada, renombrado });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 /* Verificación de la cadena de integridad de un expediente */
 app.get('/api/expedientes/:id/verificar', auth(), async (req, res) => {
