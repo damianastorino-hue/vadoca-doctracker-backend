@@ -662,12 +662,34 @@ app.post('/api/presupuestos/importar-desde-registro', auth(['admin']), async (re
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* Máquina de estados de documentos. Circuito: Borrador → En revisión → En ejecución →
+   Enviado a cliente → Entregado. Laterales: Suspendido / Cancelado.
+   Avanzar: libre. Retroceder, entrar/salir de laterales o reabrir terminales: motivo obligatorio.
+   (Validable / No validable / Aprobado quedan como legacy: se pueden abandonar, no elegir.) */
+const DOC_RANK = { 'Borrador': 0, 'En revisión': 1, 'Validable': 1, 'No validable': 1, 'En ejecución': 2, 'Enviado a cliente': 3, 'Aprobado': 4, 'Entregado': 5 };
+const DOC_TERMINALES = ['Entregado', 'Cancelado'];
+function claseTransicionDoc(viejo, nuevo) {
+  if (viejo === nuevo) return { tipo: 'igual', motivo: false };
+  if (DOC_TERMINALES.includes(viejo)) return { tipo: 'reapertura', motivo: true };
+  if (viejo === 'Suspendido') return { tipo: 'reanudación', motivo: true };
+  if (nuevo === 'Suspendido' || nuevo === 'Cancelado') return { tipo: 'lateral', motivo: true };
+  const rv = DOC_RANK[viejo] ?? 2, rn = DOC_RANK[nuevo] ?? 2;
+  return rn > rv ? { tipo: 'avance', motivo: false } : { tipo: 'retroceso', motivo: true };
+}
+
 app.post('/api/documentos/:codigo/estado', auth(['admin', 'editor']), async (req, res) => {
   try {
-    const { estado } = req.body || {};
-    const r = await pool.query(`UPDATE documentos SET estado=$1, ultimo_movimiento=now(), fecha_fin=CASE WHEN $1='Entregado' THEN $2 ELSE fecha_fin END WHERE codigo=$3 RETURNING expediente_id`, [estado, ahora().slice(0, 10), req.params.codigo]);
-    if (!r.rowCount) return res.status(404).json({ error: 'Documento no encontrado' });
-    await agregarBitacora(r.rows[0].expediente_id, req.user.email, 'estado', `${req.params.codigo} → estado: ${estado}`);
+    const { estado, motivo } = req.body || {};
+    const doc = (await pool.query('SELECT estado, expediente_id FROM documentos WHERE codigo=$1', [req.params.codigo])).rows[0];
+    if (!doc) return res.status(404).json({ error: 'Documento no encontrado' });
+    const c = claseTransicionDoc(doc.estado, estado);
+    if (c.tipo === 'igual') return res.json({ ok: true, sin_cambio: true });
+    if (c.motivo && !(motivo || '').trim())
+      return res.status(400).json({ error: `${doc.estado} → ${estado} es ${c.tipo}: requiere un motivo (queda en bitácora)` });
+    await pool.query(`UPDATE documentos SET estado=$1, ultimo_movimiento=now(), fecha_fin=CASE WHEN $1='Entregado' THEN $2 ELSE fecha_fin END WHERE codigo=$3`,
+      [estado, ahora().slice(0, 10), req.params.codigo]);
+    await agregarBitacora(doc.expediente_id, req.user.email, 'estado',
+      `${req.params.codigo} → estado: ${estado}` + (c.motivo ? ` [${c.tipo}] Motivo: ${motivo.trim()}` : ''));
     programarEspejo();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1340,13 +1362,22 @@ app.patch('/api/seguimiento/items/:id', auth(['admin', 'editor']), async (req, r
     const b = req.body || {};
 
     if (b.estado !== undefined && it.doc_codigo) {
-      const r = await pool.query(
-        `UPDATE documentos SET estado=$1, ultimo_movimiento=now(),
-         fecha_fin=CASE WHEN $1='Entregado' THEN $2 ELSE fecha_fin END
-         WHERE codigo=$3 RETURNING expediente_id`,
-        [b.estado, ahora().slice(0, 10), it.doc_codigo]);
-      if (r.rowCount)
-        await agregarBitacora(r.rows[0].expediente_id, req.user.email, 'estado', `${it.doc_codigo} → estado: ${b.estado} (desde Seguimiento)`);
+      const doc = (await pool.query('SELECT estado FROM documentos WHERE codigo=$1', [it.doc_codigo])).rows[0];
+      if (doc) {
+        const c = claseTransicionDoc(doc.estado, b.estado);
+        if (c.tipo !== 'igual') {
+          if (c.motivo && !(b.motivo || '').trim())
+            return res.status(400).json({ error: `${doc.estado} → ${b.estado} es ${c.tipo}: requiere un motivo (queda en bitácora)` });
+          const r = await pool.query(
+            `UPDATE documentos SET estado=$1, ultimo_movimiento=now(),
+             fecha_fin=CASE WHEN $1='Entregado' THEN $2 ELSE fecha_fin END
+             WHERE codigo=$3 RETURNING expediente_id`,
+            [b.estado, ahora().slice(0, 10), it.doc_codigo]);
+          if (r.rowCount)
+            await agregarBitacora(r.rows[0].expediente_id, req.user.email, 'estado',
+              `${it.doc_codigo} → estado: ${b.estado} (desde Seguimiento)` + (c.motivo ? ` [${c.tipo}] Motivo: ${String(b.motivo).trim()}` : ''));
+        }
+      }
       delete b.estado;
     }
 
