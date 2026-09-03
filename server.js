@@ -478,6 +478,20 @@ app.get('/api/expedientes/:id/bitacora', auth(), async (req, res) => {
   res.json(r.rows);
 });
 
+/* Ingesta inteligente: ¿en qué expedientes ya aparece este código en nombres de adjuntos?
+   Sirve para frenar subidas al expediente equivocado (ej: XLS083 en el expediente de XLS089). */
+app.get('/api/adjuntos/donde', auth(), async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 3) return res.json([]);
+    const r = await pool.query(
+      `SELECT expediente_id, COUNT(*)::int n FROM bitacora
+       WHERE adjuntos IS NOT NULL AND adjuntos::text ILIKE $1
+       GROUP BY expediente_id ORDER BY n DESC LIMIT 20`, ['%' + q + '%']);
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* Anulación GxP de un adjunto: la entrada original NO se toca (cadena de hashes intacta).
    Se agrega una entrada de anulación que la referencia, se renombra el archivo en Drive
    como ANULADO_..., y el frontend bloquea el link. Reversible solo por bitácora manual. */
