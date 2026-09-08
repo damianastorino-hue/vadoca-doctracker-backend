@@ -36,7 +36,7 @@ const app = express();
 app.set('trust proxy', true);
 app.use(cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN.split(','), credentials: false }));
 app.use(express.json({ limit: '2mb' }));
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 30 } });
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const ahora = () => new Date().toISOString();
@@ -709,7 +709,7 @@ app.post('/api/documentos/:codigo/estado', auth(['admin', 'editor']), async (req
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/expedientes/:id/notas', auth(['admin', 'editor']), upload.array('archivos', 10), async (req, res) => {
+app.post('/api/expedientes/:id/notas', auth(['admin', 'editor']), upload.array('archivos', 30), async (req, res) => {
   try {
     const expId = req.params.id;
     const { texto, subcarpeta } = req.body || {};
@@ -908,7 +908,7 @@ app.post('/api/procedimientos/:base/nueva-version', auth(['admin', 'editor']), a
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/procedimientos/:base/notas', auth(['admin', 'editor']), upload.array('archivos', 10), async (req, res) => {
+app.post('/api/procedimientos/:base/notas', auth(['admin', 'editor']), upload.array('archivos', 30), async (req, res) => {
   try {
     const base = req.params.base;
     const { texto, subcarpeta } = req.body || {};
@@ -1070,7 +1070,7 @@ app.post('/api/presupuestos/:codigo/estado', auth(['admin']), async (req, res) =
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post('/api/presupuestos/:codigo/notas', auth(['admin']), upload.array('archivos', 10), async (req, res) => {
+app.post('/api/presupuestos/:codigo/notas', auth(['admin']), upload.array('archivos', 30), async (req, res) => {
   try {
     const cod = req.params.codigo;
     let p = (await pool.query('SELECT * FROM presupuestos WHERE codigo=$1', [cod])).rows[0];
@@ -1172,7 +1172,7 @@ app.post('/api/expedientes/:id/proyecto', auth(['admin', 'editor']), async (req,
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post('/api/proyectos/:codigo/notas', auth(['admin', 'editor']), upload.array('archivos', 10), async (req, res) => {
+app.post('/api/proyectos/:codigo/notas', auth(['admin', 'editor']), upload.array('archivos', 30), async (req, res) => {
   try {
     const cod = req.params.codigo;
     let p = (await pool.query('SELECT * FROM proyectos WHERE codigo=$1', [cod])).rows[0];
@@ -1523,6 +1523,19 @@ app.get('/api/salud', async (_req, res) => {
   const db = await pool.query('SELECT COUNT(*)::int c FROM documentos').then(r => r.rows[0].c).catch(() => -1);
   const drive = await pool.query("SELECT 1 FROM config WHERE clave='google_refresh_token'").then(r => !!r.rowCount);
   res.json({ ok: true, documentos: db, drive_conectado: drive });
+});
+
+// Errores de subida de archivos (límite de cantidad, tamaño, campo mal formado) con mensaje claro
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const msgs = {
+      LIMIT_FILE_COUNT: 'Demasiados archivos en una sola subida (máximo 30). Subilos en dos tandas.',
+      LIMIT_FILE_SIZE: 'Un archivo supera el máximo permitido (50 MB).',
+      LIMIT_UNEXPECTED_FILE: 'Campo de archivo inesperado en la subida.'
+    };
+    return res.status(400).json({ error: msgs[err.code] || ('Error al subir archivos: ' + err.message) });
+  }
+  next(err);
 });
 
 boot().then(() => app.listen(PORT, () => console.log('DocTracker backend escuchando en :' + PORT)))
