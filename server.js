@@ -210,6 +210,15 @@ async function boot() {
       creado TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  // --- Proyectos unificados: los proyectos FARO/FlowTracker viven en la tabla proyectos ---
+  await pool.query("ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS ambito TEXT NOT NULL DEFAULT 'profesional'");
+  await pool.query("ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS notas TEXT NOT NULL DEFAULT ''");
+  const mig = await pool.query(`INSERT INTO proyectos(codigo,nombre,cliente_num,cliente_nombre,alcance,estado,autor,ultimo_movimiento,creado,ambito,notas)
+    SELECT s.codigo, s.nombre, '', s.cliente, '', s.estado, 'migracion-flowtracker', now(), s.creado, s.ambito, s.notas
+    FROM seg_proyectos s
+    WHERE s.codigo IS NOT NULL AND NOT EXISTS (SELECT 1 FROM proyectos p WHERE p.codigo = s.codigo)
+    RETURNING codigo`);
+  if (mig.rowCount) console.log('Proyectos FlowTracker migrados a la tabla proyectos:', mig.rows.map(r => r.codigo).join(', '));
   const segT = await pool.query('SELECT COUNT(*)::int n FROM seg_templates');
   if (!segT.rows[0].n) {
     const pack = (extra) => ['Plan Maestro', 'RU', 'Protocolo DQ', 'Informe DQ', 'Protocolo IQ', 'Informe IQ',
@@ -457,7 +466,7 @@ async function espejar() {
   const pres = (await pool.query('SELECT * FROM presupuestos ORDER BY codigo')).rows;
   await hoja('PRESUPUESTOS', ['Codigo', 'Cliente', 'Descripcion', 'Monto', 'Moneda', 'Fecha_Emision', 'Estado', 'Autor', 'Ultimo_Movimiento'],
     pres.map(p => [p.codigo, (p.cliente_num || '') + ' - ' + (p.cliente_nombre || ''), p.descripcion, p.monto || '', p.moneda || '', p.fecha_emision || '', p.estado, p.autor, p.ultimo_movimiento ? new Date(p.ultimo_movimiento).toISOString() : '']));
-  const proys = (await pool.query('SELECT * FROM proyectos ORDER BY codigo')).rows;
+  const proys = (await pool.query("SELECT * FROM proyectos WHERE ambito <> 'personal' ORDER BY codigo")).rows;
   const vincs = (await pool.query('SELECT * FROM proyecto_presupuestos')).rows;
   await hoja('PROYECTOS', ['Codigo', 'Nombre', 'Cliente', 'Estado', 'Presupuestos', 'Alcance', 'Autor', 'Ultimo_Movimiento'],
     proys.map(p => [p.codigo, p.nombre, (p.cliente_num || '') + ' - ' + (p.cliente_nombre || ''), p.estado, vincs.filter(v => v.proyecto === p.codigo).map(v => v.presupuesto).join(', '), (p.alcance || '').slice(0, 500), p.autor, p.ultimo_movimiento ? new Date(p.ultimo_movimiento).toISOString() : '']));
@@ -1075,7 +1084,7 @@ app.post('/api/presupuestos/:codigo/notas', auth(['admin']), upload.array('archi
    MÓDULO PROYECTOS
    ============================================================ */
 app.get('/api/proyectos', auth(), async (_req, res) => {
-  const proys = (await pool.query('SELECT * FROM proyectos ORDER BY codigo')).rows;
+  const proys = (await pool.query("SELECT * FROM proyectos WHERE ambito <> 'personal' ORDER BY codigo")).rows;
   const vincs = (await pool.query('SELECT * FROM proyecto_presupuestos')).rows;
   res.json(proys.map(p => ({ ...p, presupuestos: vincs.filter(v => v.proyecto === p.codigo).map(v => v.presupuesto) })));
 });
@@ -1250,10 +1259,10 @@ app.get('/api/indicadores', auth(), async (req, res) => {
    ============================================================ */
 
 // Todo el estado del módulo en un solo fetch
-app.get('/api/seguimiento/data', auth(), async (_req, res) => {
+app.get('/api/seguimiento/data', auth(), async (req, res) => {
   try {
     const proyectos = (await pool.query('SELECT * FROM proyectos ORDER BY creado DESC')).rows;
-    const proyectos_faro = (await pool.query('SELECT * FROM seg_proyectos ORDER BY creado DESC')).rows;
+    const proyectos_faro = []; // unificados en la tabla proyectos (compatibilidad con frontends viejos)
     const items = (await pool.query(`
       SELECT s.*, d.estado AS doc_estado, d.descripcion AS doc_descripcion, d.expediente_id AS doc_expediente
       FROM seg_items s LEFT JOIN documentos d ON d.codigo = s.doc_codigo
@@ -1261,49 +1270,64 @@ app.get('/api/seguimiento/data', auth(), async (_req, res) => {
     const templates = (await pool.query('SELECT * FROM seg_templates ORDER BY id')).rows;
     const documentos = (await pool.query(
       "SELECT codigo, proyecto, expediente_id, estado, tipo_doc, prot_inf, descripcion FROM documentos ORDER BY codigo")).rows;
-    const facturas = (await pool.query('SELECT * FROM facturas ORDER BY fecha_emision DESC, id DESC')).rows;
-    const presupuestos = (await pool.query(
-      "SELECT codigo, cliente_nombre, descripcion, monto, moneda, estado, facturacion, fecha_emision, carpeta_drive_url FROM presupuestos ORDER BY codigo DESC")).rows;
+    // Información comercial (montos): EXCLUSIVA del rol admin. Editores y lectores
+    // reciben las listas vacías y el frontend ni muestra el módulo Comercial.
+    const esAdminRol = req.user.rol === 'admin';
+    const facturas = esAdminRol
+      ? (await pool.query('SELECT * FROM facturas ORDER BY fecha_emision DESC, id DESC')).rows : [];
+    const presupuestos = esAdminRol
+      ? (await pool.query(
+          "SELECT codigo, cliente_nombre, descripcion, monto, moneda, estado, facturacion, fecha_emision, carpeta_drive_url FROM presupuestos ORDER BY codigo DESC")).rows : [];
     res.json({ proyectos, proyectos_faro, items, templates, documentos, facturas, presupuestos });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Proyectos propios de FARO (personales o profesionales fuera de DocTracker)
+// Proyectos desde FlowTracker: viven en la MISMA tabla que los de DocTracker
+// (serie PRJ- compartida). "ambito" distingue profesional/personal.
 app.post('/api/seguimiento/proyectos', auth(['admin', 'editor']), async (req, res) => {
   try {
     const { nombre, ambito, cliente, notas } = req.body || {};
     if (!nombre) return res.status(400).json({ error: 'Falta el nombre' });
     const amb = ['profesional', 'personal'].includes(ambito) ? ambito : 'personal';
-    const r = await pool.query('INSERT INTO seg_proyectos(nombre,ambito,cliente,notas) VALUES($1,$2,$3,$4) RETURNING *',
-      [nombre, amb, cliente || '', notas || '']);
-    const p = r.rows[0];
-    const codigo = 'F-' + String(p.id).padStart(3, '0');
-    await pool.query('UPDATE seg_proyectos SET codigo=$1 WHERE id=$2', [codigo, p.id]);
-    p.codigo = codigo;
-    await agregarBitacora(codigo, req.user.email, 'seguimiento', `Proyecto FARO creado: ${nombre} (${amb})`);
-    res.json(p);
+    const m = await pool.query("SELECT COALESCE(MAX(CAST(SUBSTRING(codigo FROM 'PRJ-(\\d+)') AS INT)),0) mx FROM proyectos");
+    const codigo = 'PRJ-' + String(m.rows[0].mx + 1).padStart(3, '0');
+    const r = await pool.query(`INSERT INTO proyectos(codigo,nombre,cliente_num,cliente_nombre,alcance,estado,autor,ultimo_movimiento,ambito,notas)
+      VALUES($1,$2,'',$3,'','Activo',$4,now(),$5,$6) RETURNING *`,
+      [codigo, nombre, cliente || '', req.user.email, amb, notas || '']);
+    await agregarBitacora(codigo, req.user.email, 'creacion', `Proyecto ${codigo} creado desde FlowTracker — ${nombre} (${amb}).`);
+    programarEspejo();
+    res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.patch('/api/seguimiento/proyectos/:codigo', auth(['admin', 'editor']), async (req, res) => {
   try {
     const b = req.body || {};
-    const campos = ['nombre', 'ambito', 'cliente', 'estado', 'notas'];
-    const sets = [], vals = [];
-    for (const c of campos) if (b[c] !== undefined) { vals.push(b[c]); sets.push(`${c}=$${vals.length}`); }
-    if (!sets.length) return res.status(400).json({ error: 'Nada que actualizar' });
+    const antes = (await pool.query('SELECT * FROM proyectos WHERE codigo=$1', [req.params.codigo])).rows[0];
+    if (!antes) return res.status(404).json({ error: 'Proyecto inexistente' });
+    const mapa = { nombre: 'nombre', ambito: 'ambito', cliente: 'cliente_nombre', estado: 'estado', notas: 'notas' };
+    const sets = ['ultimo_movimiento=now()'], vals = [];
+    for (const [campo, col] of Object.entries(mapa))
+      if (b[campo] !== undefined) { vals.push(b[campo]); sets.push(`${col}=$${vals.length}`); }
+    if (vals.length === 0) return res.status(400).json({ error: 'Nada que actualizar' });
     vals.push(req.params.codigo);
-    const r = await pool.query(`UPDATE seg_proyectos SET ${sets.join(',')} WHERE codigo=$${vals.length} RETURNING *`, vals);
-    if (!r.rowCount) return res.status(404).json({ error: 'Proyecto FARO inexistente' });
+    const r = await pool.query(`UPDATE proyectos SET ${sets.join(',')} WHERE codigo=$${vals.length} RETURNING *`, vals);
+    if (b.estado && b.estado !== antes.estado)
+      await agregarBitacora(req.params.codigo, req.user.email, 'estado', `Proyecto ${req.params.codigo}: estado → ${b.estado}.`);
+    programarEspejo();
     res.json(r.rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/seguimiento/proyectos/:codigo', auth(['admin', 'editor']), async (req, res) => {
   try {
-    const r = await pool.query('DELETE FROM seg_proyectos WHERE codigo=$1 RETURNING nombre', [req.params.codigo]);
-    if (!r.rowCount) return res.status(404).json({ error: 'Proyecto FARO inexistente' });
+    const docs = await pool.query('SELECT COUNT(*)::int n FROM documentos WHERE proyecto=$1', [req.params.codigo]);
+    if (docs.rows[0].n) return res.status(400).json({ error: `El proyecto tiene ${docs.rows[0].n} documento(s) vinculados: desvinculalos o cerralo en vez de borrarlo` });
+    const r = await pool.query('DELETE FROM proyectos WHERE codigo=$1 RETURNING nombre', [req.params.codigo]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Proyecto inexistente' });
     await pool.query('DELETE FROM seg_items WHERE proyecto=$1', [req.params.codigo]);
+    await logAdmin(req.user.email, 'baja_proyecto', `${req.params.codigo} — ${r.rows[0].nombre}`);
+    programarEspejo();
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1412,7 +1436,7 @@ app.get('/api/seguimiento/proyectos/:codigo/bitacora', auth(), async (req, res) 
 });
 
 // ---------- Facturas ----------
-app.post('/api/seguimiento/facturas', auth(['admin', 'editor']), async (req, res) => {
+app.post('/api/seguimiento/facturas', auth(['admin']), async (req, res) => {
   try {
     const { numero, cliente, presupuesto, fecha_emision, monto, moneda, notas } = req.body || {};
     if (!numero || !fecha_emision) return res.status(400).json({ error: 'Faltan número o fecha de emisión' });
@@ -1426,7 +1450,7 @@ app.post('/api/seguimiento/facturas', auth(['admin', 'editor']), async (req, res
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.patch('/api/seguimiento/facturas/:id', auth(['admin', 'editor']), async (req, res) => {
+app.patch('/api/seguimiento/facturas/:id', auth(['admin']), async (req, res) => {
   try {
     const antes = (await pool.query('SELECT * FROM facturas WHERE id=$1', [req.params.id])).rows[0];
     if (!antes) return res.status(404).json({ error: 'Factura inexistente' });
@@ -1444,7 +1468,7 @@ app.patch('/api/seguimiento/facturas/:id', auth(['admin', 'editor']), async (req
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/seguimiento/facturas/:id', auth(['admin', 'editor']), async (req, res) => {
+app.delete('/api/seguimiento/facturas/:id', auth(['admin']), async (req, res) => {
   try {
     const f = (await pool.query('DELETE FROM facturas WHERE id=$1 RETURNING numero,cliente', [req.params.id])).rows[0];
     if (f) await agregarBitacora('__FACTURAS__', req.user.email, 'factura', `Factura ${f.numero} eliminada (${f.cliente})`);
@@ -1453,7 +1477,7 @@ app.delete('/api/seguimiento/facturas/:id', auth(['admin', 'editor']), async (re
 });
 
 // Cerrar / reabrir el ciclo de facturación de un presupuesto
-app.patch('/api/seguimiento/presupuestos/:codigo/facturacion', auth(['admin', 'editor']), async (req, res) => {
+app.patch('/api/seguimiento/presupuestos/:codigo/facturacion', auth(['admin']), async (req, res) => {
   try {
     const estado = (req.body || {}).estado;
     if (!['Abierta', 'Cerrada'].includes(estado)) return res.status(400).json({ error: "Estado inválido (Abierta/Cerrada)" });
