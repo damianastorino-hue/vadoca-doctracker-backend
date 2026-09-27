@@ -28,9 +28,12 @@ const {
   GOOGLE_CLIENT_SECRET,   // secreto del cliente (Credenciales -> tu Client ID)
   SHEET_ID,               // planilla "VADOCA - Codigos Documentos"
   FRONTEND_ORIGIN = '*',  // ej: https://damianastorino-hue.github.io
-  INTEGRACION_API_KEY,    // clave separada del login humano, para n8n/IA. Lectura total + alta acotada en DocTracker. Sin valor = integración desactivada.
+  INTEGRACION_API_KEYS,   // clave(s) separadas del login humano, para n8n/IA. Lectura total + alta acotada en DocTracker.
+                          // Coma-separadas para poder rotar sin downtime: agregás la nueva, migrás el consumidor, sacás la vieja. Vacío = integración desactivada.
   PORT = 3000,
 } = process.env;
+const INTEGRACION_KEYS_VALIDAS = (INTEGRACION_API_KEYS || '').split(',').map(k => k.trim()).filter(Boolean);
+const esKeyIntegracionValida = (t) => t && INTEGRACION_KEYS_VALIDAS.includes(t);
 
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false });
 const app = express();
@@ -59,6 +62,16 @@ CREATE TABLE IF NOT EXISTS usuarios (
 CREATE TABLE IF NOT EXISTS config (
   clave TEXT PRIMARY KEY,
   valor TEXT
+);
+-- Idempotencia de la API de integración: cada operación trae su idempotency_key.
+-- Un reintento (timeout, corte de red entre Dami/ChatGPT/Claude y el backend) devuelve
+-- el resultado original en vez de duplicar el expediente o el adjunto.
+CREATE TABLE IF NOT EXISTS integracion_requests (
+  idempotency_key TEXT PRIMARY KEY,
+  endpoint TEXT NOT NULL,
+  huella TEXT NOT NULL,       -- fingerprint del payload (+ hash del archivo). Reintento real = misma huella.
+  resultado JSONB NOT NULL,
+  creado TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS documentos (
   id SERIAL PRIMARY KEY,
@@ -287,7 +300,7 @@ function auth(rolesPermitidos) {
     const t = (req.headers.authorization || '').replace('Bearer ', '');
     // API key de integración (n8n / IA): solo lectura (GET). Nunca reemplaza al login humano
     // ni habilita escritura acá — eso vive exclusivamente en /api/integracion/* con su propio middleware.
-    if (INTEGRACION_API_KEY && t === INTEGRACION_API_KEY) {
+    if (esKeyIntegracionValida(t)) {
       if (req.method !== 'GET') return res.status(403).json({ error: 'La integración no tiene escritura en esta ruta' });
       req.user = USUARIO_INTEGRACION;
       return next();
@@ -305,12 +318,40 @@ function auth(rolesPermitidos) {
 function authIntegracionEscritura() {
   return (req, res, next) => {
     const t = (req.headers.authorization || '').replace('Bearer ', '');
-    if (!INTEGRACION_API_KEY || t !== INTEGRACION_API_KEY)
+    if (!esKeyIntegracionValida(t))
       return res.status(401).json({ error: 'API key de integración inválida o no configurada' });
     req.user = USUARIO_INTEGRACION;
     next();
   };
 }
+/* Idempotencia: si ya procesamos esta idempotency_key para este endpoint, devolvemos
+   el resultado original sin volver a tocar Drive/Postgres. Si es nueva, ejecuta fn()
+   y guarda su resultado antes de responder. fn() debe devolver el objeto de respuesta. */
+/* huella: fingerprint del payload real (campos + hash del archivo si lo hay). Un reintento
+   genuino (mismo llamado, mandado de nuevo por un timeout) trae la MISMA idempotency_key
+   Y la MISMA huella → se devuelve el resultado original. Si la key se repite pero la huella
+   cambió (otro archivo, otros datos), es un error de uso, no un reintento: se rechaza con 409
+   en vez de devolver alegremente un resultado que no corresponde a lo que se pidió ahora. */
+async function conIdempotencia(endpoint, idemKey, huella, fn) {
+  if (idemKey) {
+    const prev = await pool.query('SELECT resultado, huella FROM integracion_requests WHERE idempotency_key=$1 AND endpoint=$2', [idemKey, endpoint]);
+    if (prev.rowCount) {
+      if (prev.rows[0].huella !== huella) {
+        const err = new Error(`idempotency_key "${idemKey}" ya se usó en ${endpoint} con datos distintos. Si es una operación nueva, generá una idempotency_key nueva.`);
+        err.conflicto = true;
+        throw err;
+      }
+      return { repetido: true, resultado: prev.rows[0].resultado };
+    }
+  }
+  const resultado = await fn();
+  if (idemKey) {
+    await pool.query('INSERT INTO integracion_requests(idempotency_key,endpoint,huella,resultado) VALUES($1,$2,$3,$4) ON CONFLICT (idempotency_key) DO NOTHING',
+      [idemKey, endpoint, huella, JSON.stringify(resultado)]);
+  }
+  return { repetido: false, resultado };
+}
+const huellaDe = (obj, archivoBuffer) => sha(JSON.stringify(obj) + '|' + (archivoBuffer ? sha(archivoBuffer) : ''));
 
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body || {};
@@ -745,19 +786,25 @@ app.post('/api/expedientes/:id/notas', auth(['admin', 'editor']), upload.array('
 
 /* ============================================================
    INTEGRACIÓN IA (n8n / Claude / ChatGPT) — API key propia, nunca el JWT admin.
-   Alcance de escritura, a propósito muy angosto: SOLO alta de expediente/documento
-   nuevo y SOLO agregar un adjunto a un documento ya existente. Nada de estados,
-   nada de anulaciones, nada de Comercial. Lectura total: ver auth()/authIntegracionEscritura()
+   Alcance de escritura, a propósito angosto: alta de expediente/documento nuevo,
+   agregar un adjunto a un documento existente, y — solo como consecuencia directa
+   de subir ese adjunto — un AVANCE de estado simple (nunca retroceso, lateral ni
+   reapertura: eso sigue siendo 100% humano, con motivo, desde la UI). Nada de
+   anulaciones, nada de Comercial. Lectura total: ver auth()/authIntegracionEscritura()
    más arriba — la misma clave sirve para leer cualquier GET protegido de la API.
    Toda acción queda en bitácora firmada como autor "integracion@vadoca.local"
    (nunca se hace pasar por un usuario humano), y programarEspejo() la refleja igual
    que cualquier alta manual.
    ============================================================ */
 
-/* Alta de expediente + documento(s) nuevos, con adjunto inicial opcional (ej: la planilla). */
+/* Alta de expediente + documento(s) nuevos, con adjunto inicial opcional (ej: la planilla).
+   idempotency_key: identificador único que el consumidor genera por operación (ej. hash del
+   archivo + código de cliente). Un reintento con la misma key devuelve el resultado original.
+   dry_run=true: valida y calcula qué se crearía, SIN insertar nada ni tocar Drive — es el
+   "preview antes de confirmar" que se ejecuta acá mismo, verificable, no solo prometido. */
 app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.single('archivo'), async (req, res) => {
   try {
-    const { ttKey, ttNombre, linea, cliente, clienteNombre, docs, desc, interno, presupuesto, proyecto, origen } = req.body || {};
+    const { ttKey, ttNombre, linea, cliente, clienteNombre, docs, desc, interno, presupuesto, proyecto, origen, idempotency_key: idemKey, dry_run } = req.body || {};
     let docsArr;
     try { docsArr = typeof docs === 'string' ? JSON.parse(docs) : docs; } catch { docsArr = null; }
     if (!ttKey || !cliente || !desc || !Array.isArray(docsArr) || !docsArr.length)
@@ -767,55 +814,102 @@ app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.sing
     const semilla = parseInt((await pool.query("SELECT valor FROM config WHERE clave=$1", [`semilla_${ttKey}_${cliente}`])).rows[0]?.valor || '0', 10);
     const docNum = Math.max(r.rows[0].m, semilla) + 1;
     const expId = `${ttKey}-${cliente}-${pad(docNum, 3)}`;
-    const fExp = await crearCarpetasExpediente(cliente, clienteNombre || '', ttNombre || ttKey, `${expId} - ${desc}`);
-    const url = `https://drive.google.com/drive/folders/${fExp}`;
-    for (const [td, pi] of docsArr) {
-      await pool.query(`INSERT INTO documentos(codigo,expediente_id,fecha_alta,cliente_num,cliente_nombre,tipo_trabajo,linea,prot_inf,tipo_doc,doc_num,version,descripcion,codigo_interno_cliente,ref_presupuesto,estado,fecha_inicio,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento,proyecto)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'Borrador',$3,$15,$16,$17,now(),$18)`,
-        [armarID(linea, td, pi, cliente, docNum, 1), expId, ahora().slice(0, 10), cliente, clienteNombre || '', ttNombre || ttKey, linea, pi, td, pad(docNum, 3), '01', desc, interno || '', presupuesto || '', fExp, url, USUARIO_INTEGRACION.email, proyecto || '']);
+    const codigosPrevistos = docsArr.map(([td, pi]) => armarID(linea, td, pi, cliente, docNum, 1));
+
+    if (String(dry_run) === 'true') {
+      // OJO: esto es una ESTIMACIÓN, no una reserva. Nadie bloquea el número acá; si entre este
+      // preview y el POST real otro alta ocupa el siguiente número, el código real puede diferir.
+      // Lo que se confirma en este paso es la OPERACIÓN (cliente/tipo/documentos/archivo), no un código puntual.
+      return res.json({ ok: true, preview: true, expediente_estimado: expId, documentos_estimados: codigosPrevistos,
+        archivo_a_subir: req.file?.originalname || null,
+        nota: 'Estimación, no reserva: el código autoritativo se asigna recién en el POST real, en el momento de la escritura. No se creó ni se tocó nada. Repetí sin dry_run para ejecutar.' });
     }
-    const adjuntos = [];
-    if (req.file) {
-      const drive = await driveCli();
-      const subId = await ensureCarpeta(drive, '00_cliente', fExp);
-      const nombre = `${ahora().slice(0, 10)}_${Buffer.from(req.file.originalname, 'latin1').toString('utf8')}`;
-      const up = await subirADrive(req.file.buffer, nombre, req.file.mimetype, subId);
-      adjuntos.push({ nombre, drive_id: up.id, subcarpeta: '00_cliente' });
-    }
-    await agregarBitacora(expId, USUARIO_INTEGRACION.email, 'creacion',
-      `Expediente creado vía integración IA${origen ? ' (' + origen + ')' : ''}. Documentos: ${docsArr.map(d => d[0] + '-' + d[1]).join(', ')}. Descripción: ${desc}`, adjuntos);
-    programarEspejo();
-    res.json({ ok: true, expediente: expId, carpeta: url });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    const huella = huellaDe({ ttKey, linea, cliente, clienteNombre, docsArr, desc, interno, presupuesto, proyecto }, req.file?.buffer);
+    const { repetido, resultado } = await conIdempotencia('expedientes', idemKey, huella, async () => {
+      const fExp = await crearCarpetasExpediente(cliente, clienteNombre || '', ttNombre || ttKey, `${expId} - ${desc}`);
+      const url = `https://drive.google.com/drive/folders/${fExp}`;
+      for (const [td, pi] of docsArr) {
+        await pool.query(`INSERT INTO documentos(codigo,expediente_id,fecha_alta,cliente_num,cliente_nombre,tipo_trabajo,linea,prot_inf,tipo_doc,doc_num,version,descripcion,codigo_interno_cliente,ref_presupuesto,estado,fecha_inicio,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento,proyecto)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'Borrador',$3,$15,$16,$17,now(),$18)`,
+          [armarID(linea, td, pi, cliente, docNum, 1), expId, ahora().slice(0, 10), cliente, clienteNombre || '', ttNombre || ttKey, linea, pi, td, pad(docNum, 3), '01', desc, interno || '', presupuesto || '', fExp, url, USUARIO_INTEGRACION.email, proyecto || '']);
+      }
+      const adjuntos = [];
+      if (req.file) {
+        const drive = await driveCli();
+        const subId = await ensureCarpeta(drive, '00_cliente', fExp);
+        const nombre = `${ahora().slice(0, 10)}_${Buffer.from(req.file.originalname, 'latin1').toString('utf8')}`;
+        const up = await subirADrive(req.file.buffer, nombre, req.file.mimetype, subId);
+        adjuntos.push({ nombre, drive_id: up.id, subcarpeta: '00_cliente', hash_sha256: sha(req.file.buffer), nombre_original: req.file.originalname });
+      }
+      await agregarBitacora(expId, USUARIO_INTEGRACION.email, 'creacion',
+        `Expediente creado vía integración IA${origen ? ' (' + origen + ')' : ''} [endpoint:/api/integracion/expedientes${idemKey ? ' idem:' + idemKey : ''}]. Documentos: ${docsArr.map(d => d[0] + '-' + d[1]).join(', ')}. Descripción: ${desc}`, adjuntos);
+      programarEspejo();
+      return { ok: true, expediente: expId, carpeta: url };
+    });
+    res.json({ ...resultado, repetido });
+  } catch (e) { res.status(e.conflicto ? 409 : 500).json({ error: e.message }); }
 });
 
 /* Adjuntar UN archivo a un documento/código YA EXISTENTE. 'frase' es la etiqueta que Dami
    trae en su tabla (ej: "RU para firmar", "PDF firmado") y queda tal cual en la bitácora.
-   No toca estado del documento — eso lo sigue confirmando Dami a mano en la UI. */
+   idempotency_key y dry_run funcionan igual que en /api/integracion/expedientes.
+
+   avanzar_a (opcional): permite que ESTA subida dispare un cambio de estado — pero solo si
+   claseTransicionDoc() lo clasifica como 'avance' puro (motivo:false). Cualquier retroceso,
+   lateral (Suspendido/Cancelado) o reapertura de terminal se rechaza siempre, sin excepción,
+   la pida quien la pida — esas siguen siendo 100% humanas, con motivo, desde la UI. La reutilización
+   de claseTransicionDoc (la MISMA función que usa el endpoint humano /api/documentos/:codigo/estado)
+   garantiza que la integración nunca tenga una regla distinta ni más permisiva que un usuario real. */
 app.post('/api/integracion/adjuntos', authIntegracionEscritura(), upload.single('archivo'), async (req, res) => {
   try {
-    const { codigo, frase, origen } = req.body || {};
+    const { codigo, frase, origen, idempotency_key: idemKey, dry_run, avanzar_a: avanzarA } = req.body || {};
     if (!codigo) return res.status(400).json({ error: 'Falta el código del documento' });
     if (!req.file) return res.status(400).json({ error: 'Falta el archivo' });
     const doc = (await pool.query('SELECT * FROM documentos WHERE codigo=$1', [codigo])).rows[0];
     if (!doc) return res.status(404).json({ error: `No existe el documento ${codigo}` });
-    let carpetaId = doc.carpeta_drive_id;
-    if (!carpetaId) {
-      carpetaId = await crearCarpetasExpediente(doc.cliente_num, doc.cliente_nombre, doc.tipo_trabajo, `${doc.expediente_id} - ${doc.descripcion}`);
-      await pool.query('UPDATE documentos SET carpeta_drive_id=$1, carpeta_drive_url=$2 WHERE expediente_id=$3',
-        [carpetaId, `https://drive.google.com/drive/folders/${carpetaId}`, doc.expediente_id]);
+
+    let clase = null;
+    if (avanzarA) {
+      clase = claseTransicionDoc(doc.estado, avanzarA);
+      if (clase.tipo !== 'igual' && clase.motivo)
+        return res.status(403).json({ error: `${doc.estado} → ${avanzarA} es un ${clase.tipo}: requiere motivo y confirmación humana en la UI. La integración solo puede hacer avances simples.` });
     }
-    const drive = await driveCli();
-    const subId = await ensureCarpeta(drive, '02_evidencias', carpetaId);
-    const nombre = `${ahora().slice(0, 10)}_${Buffer.from(req.file.originalname, 'latin1').toString('utf8')}`;
-    const up = await subirADrive(req.file.buffer, nombre, req.file.mimetype, subId);
-    const adjuntos = [{ nombre, drive_id: up.id, subcarpeta: '02_evidencias' }];
-    const texto = (frase ? `[${frase}] ` : 'Adjunto vía integración IA: ') + nombre + (origen ? ` (${origen})` : '');
-    const entrada = await agregarBitacora(doc.expediente_id, USUARIO_INTEGRACION.email, 'archivo', texto, adjuntos);
-    await pool.query('UPDATE documentos SET ultimo_movimiento=now() WHERE codigo=$1', [codigo]);
-    programarEspejo();
-    res.json({ ok: true, entrada, documento: codigo });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+
+    if (String(dry_run) === 'true') {
+      return res.json({ ok: true, preview: true, documento: codigo, expediente: doc.expediente_id, frase_a_registrar: frase || null,
+        archivo_a_subir: req.file.originalname,
+        cambio_de_estado: avanzarA ? `${doc.estado} → ${avanzarA} (${clase.tipo})` : 'ninguno',
+        nota: 'No se subió ni cambió nada. Confirmá y repetí sin dry_run para ejecutar.' });
+    }
+
+    const huella = huellaDe({ codigo, frase, avanzarA }, req.file.buffer);
+    const { repetido, resultado } = await conIdempotencia('adjuntos', idemKey, huella, async () => {
+      let carpetaId = doc.carpeta_drive_id;
+      if (!carpetaId) {
+        carpetaId = await crearCarpetasExpediente(doc.cliente_num, doc.cliente_nombre, doc.tipo_trabajo, `${doc.expediente_id} - ${doc.descripcion}`);
+        await pool.query('UPDATE documentos SET carpeta_drive_id=$1, carpeta_drive_url=$2 WHERE expediente_id=$3',
+          [carpetaId, `https://drive.google.com/drive/folders/${carpetaId}`, doc.expediente_id]);
+      }
+      const drive = await driveCli();
+      const subId = await ensureCarpeta(drive, '02_evidencias', carpetaId);
+      const nombre = `${ahora().slice(0, 10)}_${Buffer.from(req.file.originalname, 'latin1').toString('utf8')}`;
+      const up = await subirADrive(req.file.buffer, nombre, req.file.mimetype, subId);
+      const adjuntos = [{ nombre, drive_id: up.id, subcarpeta: '02_evidencias', hash_sha256: sha(req.file.buffer), nombre_original: req.file.originalname }];
+      const cambioTexto = (avanzarA && clase && clase.tipo !== 'igual') ? ` | Estado: ${doc.estado} → ${avanzarA} [avance automático por adjunto]` : '';
+      const texto = (frase ? `[${frase}] ` : 'Adjunto vía integración IA: ') + nombre + (origen ? ` (${origen})` : '') + cambioTexto + ` [endpoint:/api/integracion/adjuntos${idemKey ? ' idem:' + idemKey : ''}]`;
+      const entrada = await agregarBitacora(doc.expediente_id, USUARIO_INTEGRACION.email, 'archivo', texto, adjuntos);
+      if (avanzarA && clase && clase.tipo !== 'igual') {
+        await pool.query(`UPDATE documentos SET estado=$1, ultimo_movimiento=now(), fecha_fin=CASE WHEN $1='Entregado' THEN $2 ELSE fecha_fin END WHERE codigo=$3`,
+          [avanzarA, ahora().slice(0, 10), codigo]);
+      } else {
+        await pool.query('UPDATE documentos SET ultimo_movimiento=now() WHERE codigo=$1', [codigo]);
+      }
+      programarEspejo();
+      return { ok: true, entrada, documento: codigo, estado_nuevo: avanzarA && clase && clase.tipo !== 'igual' ? avanzarA : doc.estado };
+    });
+    res.json({ ...resultado, repetido });
+  } catch (e) { res.status(e.conflicto ? 409 : 500).json({ error: e.message }); }
 });
 
 app.post('/api/expedientes/:id/nueva-version', auth(['admin', 'editor']), async (req, res) => {
