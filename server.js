@@ -1449,25 +1449,44 @@ app.get('/api/indicadores', auth(), async (req, res) => {
    ============================================================ */
 
 // Todo el estado del módulo en un solo fetch
+// Filtros opcionales (expediente_id, cliente_num, codigo): acotan la respuesta a los
+// documentos que matchean, y devuelven el resto de las listas vacías. Pensado para
+// consumidores programáticos (integración IA) que no necesitan ni pueden manejar el
+// dump completo. Con key de integración, alguno de los tres filtros es OBLIGATORIO —
+// nunca se le entrega el universo completo de un solo request. El login humano (JWT)
+// sigue recibiendo el dump completo cuando no manda filtros, para no tocar la UI.
 app.get('/api/seguimiento/data', auth(), async (req, res) => {
   try {
-    const proyectos = (await pool.query('SELECT * FROM proyectos ORDER BY creado DESC')).rows;
+    const { expediente_id, cliente_num, codigo } = req.query;
+    const esIntegracion = req.user.rol === 'integracion';
+    if (esIntegracion && !expediente_id && !cliente_num && !codigo) {
+      return res.status(400).json({ error: 'La key de integración requiere un filtro (expediente_id, cliente_num o codigo) — no puede leer el listado completo.' });
+    }
+    const vals = [];
+    const filtros = [];
+    if (expediente_id) { vals.push(expediente_id); filtros.push(`expediente_id=$${vals.length}`); }
+    if (cliente_num) { vals.push(cliente_num); filtros.push(`cliente_num=$${vals.length}`); }
+    if (codigo) { vals.push(codigo); filtros.push(`codigo=$${vals.length}`); }
+    const filtrado = filtros.length > 0;
+    const whereDocs = filtrado ? 'WHERE ' + filtros.join(' AND ') : '';
+
+    const proyectos = filtrado ? [] : (await pool.query('SELECT * FROM proyectos ORDER BY creado DESC')).rows;
     const proyectos_faro = []; // unificados en la tabla proyectos (compatibilidad con frontends viejos)
-    const items = (await pool.query(`
+    const items = filtrado ? [] : (await pool.query(`
       SELECT s.*, d.estado AS doc_estado, d.descripcion AS doc_descripcion, d.expediente_id AS doc_expediente
       FROM seg_items s LEFT JOIN documentos d ON d.codigo = s.doc_codigo
       ORDER BY s.orden, s.id`)).rows;
-    const templates = (await pool.query('SELECT * FROM seg_templates ORDER BY id')).rows;
+    const templates = filtrado ? [] : (await pool.query('SELECT * FROM seg_templates ORDER BY id')).rows;
     const documentos = (await pool.query(
-      "SELECT codigo, proyecto, expediente_id, estado, tipo_doc, prot_inf, descripcion FROM documentos ORDER BY codigo")).rows;
+      `SELECT codigo, proyecto, expediente_id, cliente_num, estado, tipo_doc, prot_inf, descripcion FROM documentos ${whereDocs} ORDER BY codigo`, vals)).rows;
     // Información comercial (montos): EXCLUSIVA de admin e integración (auditoría de solo lectura).
     // Editores y lectores reciben las listas vacías y el frontend ni muestra el módulo Comercial.
     const esAdminRol = req.user.rol === 'admin' || req.user.rol === 'integracion';
-    const facturas = esAdminRol
-      ? (await pool.query('SELECT * FROM facturas ORDER BY fecha_emision DESC, id DESC')).rows : [];
-    const presupuestos = esAdminRol
-      ? (await pool.query(
-          "SELECT codigo, cliente_nombre, descripcion, monto, moneda, estado, facturacion, fecha_emision, carpeta_drive_url FROM presupuestos ORDER BY codigo DESC")).rows : [];
+    const facturas = (filtrado || !esAdminRol)
+      ? [] : (await pool.query('SELECT * FROM facturas ORDER BY fecha_emision DESC, id DESC')).rows;
+    const presupuestos = (filtrado || !esAdminRol)
+      ? [] : (await pool.query(
+          "SELECT codigo, cliente_nombre, descripcion, monto, moneda, estado, facturacion, fecha_emision, carpeta_drive_url FROM presupuestos ORDER BY codigo DESC")).rows;
     res.json({ proyectos, proyectos_faro, items, templates, documentos, facturas, presupuestos });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
