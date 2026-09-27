@@ -28,6 +28,7 @@ const {
   GOOGLE_CLIENT_SECRET,   // secreto del cliente (Credenciales -> tu Client ID)
   SHEET_ID,               // planilla "VADOCA - Codigos Documentos"
   FRONTEND_ORIGIN = '*',  // ej: https://damianastorino-hue.github.io
+  INTEGRACION_API_KEY,    // clave separada del login humano, para n8n/IA. Lectura total + alta acotada en DocTracker. Sin valor = integración desactivada.
   PORT = 3000,
 } = process.env;
 
@@ -279,15 +280,35 @@ async function logAdmin(autor, accion, detalle = '') {
 function firmar(u) {
   return jwt.sign({ id: u.id, email: u.email, nombre: u.nombre, rol: u.rol }, JWT_SECRET, { expiresIn: '12h' });
 }
+const USUARIO_INTEGRACION = { id: 0, email: 'integracion@vadoca.local', nombre: 'Integración IA', rol: 'integracion' };
+
 function auth(rolesPermitidos) {
   return (req, res, next) => {
     const t = (req.headers.authorization || '').replace('Bearer ', '');
+    // API key de integración (n8n / IA): solo lectura (GET). Nunca reemplaza al login humano
+    // ni habilita escritura acá — eso vive exclusivamente en /api/integracion/* con su propio middleware.
+    if (INTEGRACION_API_KEY && t === INTEGRACION_API_KEY) {
+      if (req.method !== 'GET') return res.status(403).json({ error: 'La integración no tiene escritura en esta ruta' });
+      req.user = USUARIO_INTEGRACION;
+      return next();
+    }
     try {
       req.user = jwt.verify(t, JWT_SECRET);
       if (rolesPermitidos && !rolesPermitidos.includes(req.user.rol))
         return res.status(403).json({ error: 'No tenés permisos para esta acción' });
       next();
     } catch (e) { res.status(401).json({ error: 'Sesión inválida o vencida' }); }
+  };
+}
+/* Middleware exclusivo para los 2 endpoints de escritura habilitados a la integración.
+   Nada más en toda la API acepta esta clave para un método distinto de GET. */
+function authIntegracionEscritura() {
+  return (req, res, next) => {
+    const t = (req.headers.authorization || '').replace('Bearer ', '');
+    if (!INTEGRACION_API_KEY || t !== INTEGRACION_API_KEY)
+      return res.status(401).json({ error: 'API key de integración inválida o no configurada' });
+    req.user = USUARIO_INTEGRACION;
+    next();
   };
 }
 
@@ -719,6 +740,81 @@ app.post('/api/expedientes/:id/notas', auth(['admin', 'editor']), upload.array('
     await pool.query('UPDATE documentos SET ultimo_movimiento=now() WHERE expediente_id=$1', [expId]);
     programarEspejo();
     res.json({ ok: true, entrada });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================================================
+   INTEGRACIÓN IA (n8n / Claude / ChatGPT) — API key propia, nunca el JWT admin.
+   Alcance de escritura, a propósito muy angosto: SOLO alta de expediente/documento
+   nuevo y SOLO agregar un adjunto a un documento ya existente. Nada de estados,
+   nada de anulaciones, nada de Comercial. Lectura total: ver auth()/authIntegracionEscritura()
+   más arriba — la misma clave sirve para leer cualquier GET protegido de la API.
+   Toda acción queda en bitácora firmada como autor "integracion@vadoca.local"
+   (nunca se hace pasar por un usuario humano), y programarEspejo() la refleja igual
+   que cualquier alta manual.
+   ============================================================ */
+
+/* Alta de expediente + documento(s) nuevos, con adjunto inicial opcional (ej: la planilla). */
+app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.single('archivo'), async (req, res) => {
+  try {
+    const { ttKey, ttNombre, linea, cliente, clienteNombre, docs, desc, interno, presupuesto, proyecto, origen } = req.body || {};
+    let docsArr;
+    try { docsArr = typeof docs === 'string' ? JSON.parse(docs) : docs; } catch { docsArr = null; }
+    if (!ttKey || !cliente || !desc || !Array.isArray(docsArr) || !docsArr.length)
+      return res.status(400).json({ error: 'Faltan datos del expediente (ttKey, cliente, desc, docs=[[tipoDoc,protInf],...])' });
+
+    const r = await pool.query("SELECT COALESCE(MAX(CAST(doc_num AS INT)),0) m FROM documentos WHERE expediente_id LIKE $1", [`${ttKey}-${cliente}-%`]);
+    const semilla = parseInt((await pool.query("SELECT valor FROM config WHERE clave=$1", [`semilla_${ttKey}_${cliente}`])).rows[0]?.valor || '0', 10);
+    const docNum = Math.max(r.rows[0].m, semilla) + 1;
+    const expId = `${ttKey}-${cliente}-${pad(docNum, 3)}`;
+    const fExp = await crearCarpetasExpediente(cliente, clienteNombre || '', ttNombre || ttKey, `${expId} - ${desc}`);
+    const url = `https://drive.google.com/drive/folders/${fExp}`;
+    for (const [td, pi] of docsArr) {
+      await pool.query(`INSERT INTO documentos(codigo,expediente_id,fecha_alta,cliente_num,cliente_nombre,tipo_trabajo,linea,prot_inf,tipo_doc,doc_num,version,descripcion,codigo_interno_cliente,ref_presupuesto,estado,fecha_inicio,carpeta_drive_id,carpeta_drive_url,autor,ultimo_movimiento,proyecto)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'Borrador',$3,$15,$16,$17,now(),$18)`,
+        [armarID(linea, td, pi, cliente, docNum, 1), expId, ahora().slice(0, 10), cliente, clienteNombre || '', ttNombre || ttKey, linea, pi, td, pad(docNum, 3), '01', desc, interno || '', presupuesto || '', fExp, url, USUARIO_INTEGRACION.email, proyecto || '']);
+    }
+    const adjuntos = [];
+    if (req.file) {
+      const drive = await driveCli();
+      const subId = await ensureCarpeta(drive, '00_cliente', fExp);
+      const nombre = `${ahora().slice(0, 10)}_${Buffer.from(req.file.originalname, 'latin1').toString('utf8')}`;
+      const up = await subirADrive(req.file.buffer, nombre, req.file.mimetype, subId);
+      adjuntos.push({ nombre, drive_id: up.id, subcarpeta: '00_cliente' });
+    }
+    await agregarBitacora(expId, USUARIO_INTEGRACION.email, 'creacion',
+      `Expediente creado vía integración IA${origen ? ' (' + origen + ')' : ''}. Documentos: ${docsArr.map(d => d[0] + '-' + d[1]).join(', ')}. Descripción: ${desc}`, adjuntos);
+    programarEspejo();
+    res.json({ ok: true, expediente: expId, carpeta: url });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* Adjuntar UN archivo a un documento/código YA EXISTENTE. 'frase' es la etiqueta que Dami
+   trae en su tabla (ej: "RU para firmar", "PDF firmado") y queda tal cual en la bitácora.
+   No toca estado del documento — eso lo sigue confirmando Dami a mano en la UI. */
+app.post('/api/integracion/adjuntos', authIntegracionEscritura(), upload.single('archivo'), async (req, res) => {
+  try {
+    const { codigo, frase, origen } = req.body || {};
+    if (!codigo) return res.status(400).json({ error: 'Falta el código del documento' });
+    if (!req.file) return res.status(400).json({ error: 'Falta el archivo' });
+    const doc = (await pool.query('SELECT * FROM documentos WHERE codigo=$1', [codigo])).rows[0];
+    if (!doc) return res.status(404).json({ error: `No existe el documento ${codigo}` });
+    let carpetaId = doc.carpeta_drive_id;
+    if (!carpetaId) {
+      carpetaId = await crearCarpetasExpediente(doc.cliente_num, doc.cliente_nombre, doc.tipo_trabajo, `${doc.expediente_id} - ${doc.descripcion}`);
+      await pool.query('UPDATE documentos SET carpeta_drive_id=$1, carpeta_drive_url=$2 WHERE expediente_id=$3',
+        [carpetaId, `https://drive.google.com/drive/folders/${carpetaId}`, doc.expediente_id]);
+    }
+    const drive = await driveCli();
+    const subId = await ensureCarpeta(drive, '02_evidencias', carpetaId);
+    const nombre = `${ahora().slice(0, 10)}_${Buffer.from(req.file.originalname, 'latin1').toString('utf8')}`;
+    const up = await subirADrive(req.file.buffer, nombre, req.file.mimetype, subId);
+    const adjuntos = [{ nombre, drive_id: up.id, subcarpeta: '02_evidencias' }];
+    const texto = (frase ? `[${frase}] ` : 'Adjunto vía integración IA: ') + nombre + (origen ? ` (${origen})` : '');
+    const entrada = await agregarBitacora(doc.expediente_id, USUARIO_INTEGRACION.email, 'archivo', texto, adjuntos);
+    await pool.query('UPDATE documentos SET ultimo_movimiento=now() WHERE codigo=$1', [codigo]);
+    programarEspejo();
+    res.json({ ok: true, entrada, documento: codigo });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1270,9 +1366,9 @@ app.get('/api/seguimiento/data', auth(), async (req, res) => {
     const templates = (await pool.query('SELECT * FROM seg_templates ORDER BY id')).rows;
     const documentos = (await pool.query(
       "SELECT codigo, proyecto, expediente_id, estado, tipo_doc, prot_inf, descripcion FROM documentos ORDER BY codigo")).rows;
-    // Información comercial (montos): EXCLUSIVA del rol admin. Editores y lectores
-    // reciben las listas vacías y el frontend ni muestra el módulo Comercial.
-    const esAdminRol = req.user.rol === 'admin';
+    // Información comercial (montos): EXCLUSIVA de admin e integración (auditoría de solo lectura).
+    // Editores y lectores reciben las listas vacías y el frontend ni muestra el módulo Comercial.
+    const esAdminRol = req.user.rol === 'admin' || req.user.rol === 'integracion';
     const facturas = esAdminRol
       ? (await pool.query('SELECT * FROM facturas ORDER BY fecha_emision DESC, id DESC')).rows : [];
     const presupuestos = esAdminRol
