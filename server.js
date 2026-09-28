@@ -42,12 +42,11 @@ app.use(cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN.split(',
 app.use(express.json({ limit: '15mb' }));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 30 } });
 
-/* Permite adjuntar un archivo también vía JSON puro (base64), para consumidores que no pueden
-   armar multipart/form-data — típicamente un Custom GPT Action de ChatGPT, que solo puede
-   pasar un archivo subido en el chat como string base64 dentro del body. Va DESPUÉS de
-   upload.single('archivo'): si la request ya vino como multipart (n8n, PowerShell -F), multer
-   ya cargó req.file y esto no hace nada. Si vino como JSON con archivo_base64, arma un req.file
-   equivalente al que multer hubiera armado, y el resto del endpoint no distingue el origen. */
+/* Permite adjuntar un archivo también vía JSON puro (base64), para consumidores que ya tienen
+   los bytes en mano y no arman multipart/form-data. Va DESPUÉS de upload.single('archivo'):
+   si la request ya vino como multipart (n8n, PowerShell -F), multer ya cargó req.file y esto
+   no hace nada. Si vino como JSON con archivo_base64, arma un req.file equivalente al que
+   multer hubiera armado, y el resto del endpoint no distingue el origen. */
 function archivoDesdeBase64(req, res, next) {
   if (!req.file && req.body && req.body.archivo_base64) {
     try {
@@ -56,6 +55,28 @@ function archivoDesdeBase64(req, res, next) {
       req.file = { buffer, originalname: req.body.nombre_original || 'archivo', mimetype: req.body.mimetype || 'application/octet-stream' };
     } catch (e) {
       return res.status(400).json({ error: 'archivo_base64 inválido: ' + e.message });
+    }
+  }
+  next();
+}
+
+/* Mecanismo REAL de un Custom GPT Action de ChatGPT: cuando el usuario sube un archivo en el
+   chat, ChatGPT NO manda el contenido — manda una referencia `openaiFileIdRefs` (array; usamos
+   el primer elemento) con {name, mime_type, download_link}, y el download_link es válido solo
+   5 minutos. Este middleware lo descarga server-side y arma un req.file equivalente al de
+   multer. Va después de archivoDesdeBase64: si ya hay archivo cargado, no hace nada. */
+async function archivoDesdeReferencia(req, res, next) {
+  if (!req.file && req.body && Array.isArray(req.body.openaiFileIdRefs) && req.body.openaiFileIdRefs.length) {
+    const ref = req.body.openaiFileIdRefs[0];
+    if (!ref || !ref.download_link) return res.status(400).json({ error: 'openaiFileIdRefs sin download_link' });
+    try {
+      const r = await fetch(ref.download_link);
+      if (!r.ok) return res.status(400).json({ error: `No se pudo descargar el archivo referenciado: HTTP ${r.status}` });
+      const buffer = Buffer.from(await r.arrayBuffer());
+      if (!buffer.length) return res.status(400).json({ error: 'El archivo descargado vía openaiFileIdRefs está vacío' });
+      req.file = { buffer, originalname: ref.name || req.body.nombre_original || 'archivo', mimetype: ref.mime_type || req.body.mimetype || 'application/octet-stream' };
+    } catch (e) {
+      return res.status(400).json({ error: 'No se pudo descargar el archivo referenciado (el link de ChatGPT dura solo 5 minutos): ' + e.message });
     }
   }
   next();
@@ -821,7 +842,7 @@ app.post('/api/expedientes/:id/notas', auth(['admin', 'editor']), upload.array('
    archivo + código de cliente). Un reintento con la misma key devuelve el resultado original.
    dry_run=true: valida y calcula qué se crearía, SIN insertar nada ni tocar Drive — es el
    "preview antes de confirmar" que se ejecuta acá mismo, verificable, no solo prometido. */
-app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.single('archivo'), archivoDesdeBase64, async (req, res) => {
+app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.single('archivo'), archivoDesdeBase64, archivoDesdeReferencia, async (req, res) => {
   try {
     const { ttKey, ttNombre, linea, cliente, clienteNombre, docs, desc, interno, presupuesto, proyecto, origen, idempotency_key: idemKey, dry_run } = req.body || {};
     let docsArr;
@@ -880,7 +901,7 @@ app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.sing
    la pida quien la pida — esas siguen siendo 100% humanas, con motivo, desde la UI. La reutilización
    de claseTransicionDoc (la MISMA función que usa el endpoint humano /api/documentos/:codigo/estado)
    garantiza que la integración nunca tenga una regla distinta ni más permisiva que un usuario real. */
-app.post('/api/integracion/adjuntos', authIntegracionEscritura(), upload.single('archivo'), archivoDesdeBase64, async (req, res) => {
+app.post('/api/integracion/adjuntos', authIntegracionEscritura(), upload.single('archivo'), archivoDesdeBase64, archivoDesdeReferencia, async (req, res) => {
   try {
     const { codigo, frase, origen, idempotency_key: idemKey, dry_run, avanzar_a: avanzarA } = req.body || {};
     if (!codigo) return res.status(400).json({ error: 'Falta el código del documento' });
