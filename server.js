@@ -39,8 +39,27 @@ const pool = new Pool({ connectionString: DATABASE_URL, ssl: DATABASE_URL?.inclu
 const app = express();
 app.set('trust proxy', true);
 app.use(cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN.split(','), credentials: false }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '15mb' }));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 30 } });
+
+/* Permite adjuntar un archivo también vía JSON puro (base64), para consumidores que no pueden
+   armar multipart/form-data — típicamente un Custom GPT Action de ChatGPT, que solo puede
+   pasar un archivo subido en el chat como string base64 dentro del body. Va DESPUÉS de
+   upload.single('archivo'): si la request ya vino como multipart (n8n, PowerShell -F), multer
+   ya cargó req.file y esto no hace nada. Si vino como JSON con archivo_base64, arma un req.file
+   equivalente al que multer hubiera armado, y el resto del endpoint no distingue el origen. */
+function archivoDesdeBase64(req, res, next) {
+  if (!req.file && req.body && req.body.archivo_base64) {
+    try {
+      const buffer = Buffer.from(req.body.archivo_base64, 'base64');
+      if (!buffer.length) return res.status(400).json({ error: 'archivo_base64 vacío o inválido' });
+      req.file = { buffer, originalname: req.body.nombre_original || 'archivo', mimetype: req.body.mimetype || 'application/octet-stream' };
+    } catch (e) {
+      return res.status(400).json({ error: 'archivo_base64 inválido: ' + e.message });
+    }
+  }
+  next();
+}
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const ahora = () => new Date().toISOString();
@@ -802,7 +821,7 @@ app.post('/api/expedientes/:id/notas', auth(['admin', 'editor']), upload.array('
    archivo + código de cliente). Un reintento con la misma key devuelve el resultado original.
    dry_run=true: valida y calcula qué se crearía, SIN insertar nada ni tocar Drive — es el
    "preview antes de confirmar" que se ejecuta acá mismo, verificable, no solo prometido. */
-app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.single('archivo'), async (req, res) => {
+app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.single('archivo'), archivoDesdeBase64, async (req, res) => {
   try {
     const { ttKey, ttNombre, linea, cliente, clienteNombre, docs, desc, interno, presupuesto, proyecto, origen, idempotency_key: idemKey, dry_run } = req.body || {};
     let docsArr;
@@ -861,7 +880,7 @@ app.post('/api/integracion/expedientes', authIntegracionEscritura(), upload.sing
    la pida quien la pida — esas siguen siendo 100% humanas, con motivo, desde la UI. La reutilización
    de claseTransicionDoc (la MISMA función que usa el endpoint humano /api/documentos/:codigo/estado)
    garantiza que la integración nunca tenga una regla distinta ni más permisiva que un usuario real. */
-app.post('/api/integracion/adjuntos', authIntegracionEscritura(), upload.single('archivo'), async (req, res) => {
+app.post('/api/integracion/adjuntos', authIntegracionEscritura(), upload.single('archivo'), archivoDesdeBase64, async (req, res) => {
   try {
     const { codigo, frase, origen, idempotency_key: idemKey, dry_run, avanzar_a: avanzarA } = req.body || {};
     if (!codigo) return res.status(400).json({ error: 'Falta el código del documento' });
