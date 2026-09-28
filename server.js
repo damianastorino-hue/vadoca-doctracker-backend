@@ -1497,16 +1497,17 @@ app.get('/api/indicadores', auth(), async (req, res) => {
 // sigue recibiendo el dump completo cuando no manda filtros, para no tocar la UI.
 app.get('/api/seguimiento/data', auth(), async (req, res) => {
   try {
-    const { expediente_id, cliente_num, codigo } = req.query;
+    const { expediente_id, cliente_num, codigo, codigo_interno_cliente } = req.query;
     const esIntegracion = req.user.rol === 'integracion';
-    if (esIntegracion && !expediente_id && !cliente_num && !codigo) {
-      return res.status(400).json({ error: 'La key de integración requiere un filtro (expediente_id, cliente_num o codigo) — no puede leer el listado completo.' });
+    if (esIntegracion && !expediente_id && !cliente_num && !codigo && !codigo_interno_cliente) {
+      return res.status(400).json({ error: 'La key de integración requiere un filtro (expediente_id, cliente_num, codigo o codigo_interno_cliente) — no puede leer el listado completo.' });
     }
     const vals = [];
     const filtros = [];
     if (expediente_id) { vals.push(expediente_id); filtros.push(`expediente_id=$${vals.length}`); }
     if (cliente_num) { vals.push(cliente_num); filtros.push(`cliente_num=$${vals.length}`); }
     if (codigo) { vals.push(codigo); filtros.push(`codigo=$${vals.length}`); }
+    if (codigo_interno_cliente) { vals.push(codigo_interno_cliente); filtros.push(`codigo_interno_cliente=$${vals.length}`); }
     const filtrado = filtros.length > 0;
     const whereDocs = filtrado ? 'WHERE ' + filtros.join(' AND ') : '';
 
@@ -1518,7 +1519,7 @@ app.get('/api/seguimiento/data', auth(), async (req, res) => {
       ORDER BY s.orden, s.id`)).rows;
     const templates = filtrado ? [] : (await pool.query('SELECT * FROM seg_templates ORDER BY id')).rows;
     const documentos = (await pool.query(
-      `SELECT codigo, proyecto, expediente_id, cliente_num, estado, tipo_doc, prot_inf, descripcion FROM documentos ${whereDocs} ORDER BY codigo`, vals)).rows;
+      `SELECT codigo, proyecto, expediente_id, cliente_num, codigo_interno_cliente, estado, tipo_doc, prot_inf, descripcion FROM documentos ${whereDocs} ORDER BY codigo`, vals)).rows;
     // Información comercial (montos): EXCLUSIVA de admin e integración (auditoría de solo lectura).
     // Editores y lectores reciben las listas vacías y el frontend ni muestra el módulo Comercial.
     const esAdminRol = req.user.rol === 'admin' || req.user.rol === 'integracion';
