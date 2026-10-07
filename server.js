@@ -784,18 +784,32 @@ app.get('/api/integracion/pendientes', auth(), async (req, res) => {
 
 /* Estado de proyectos, con cuántos documentos de cada uno siguen pendientes — "cómo
    viene tal proyecto" sin tener que pedir expediente por expediente. estado=todos trae
-   también los no-activos (por defecto solo los activos). */
+   también los cerrados (por defecto solo los que siguen con trabajo real).
+
+   OJO: la columna `estado` de la tabla puede quedar desincronizada de la realidad (un
+   proyecto marcado 'Cerrado' a mano que en los hechos todavía tiene documentos sin
+   entregar) — el panel web NO usa esa columna cruda para la etiqueta que le muestra a
+   Dami, la calcula según si quedan documentos pendientes. Acá hacemos lo mismo: un
+   proyecto con documentos_pendientes > 0 se considera activo pase lo que diga `estado`,
+   y la columna cruda se expone aparte (estado_db) solo como referencia/diagnóstico, para
+   poder detectar y flaggear esa desincronización en vez de repetirla. */
 app.get('/api/integracion/proyectos', auth(), async (req, res) => {
   try {
-    const soloActivos = req.query.estado !== 'todos';
+    const todos = req.query.estado === 'todos';
     const proys = (await pool.query(
-      `SELECT codigo, nombre, cliente_num, cliente_nombre, estado, ultimo_movimiento
-       FROM proyectos WHERE ambito <> 'personal' ${soloActivos ? "AND estado = 'Activo'" : ''}
-       ORDER BY ultimo_movimiento DESC NULLS LAST LIMIT 200`)).rows;
+      `SELECT codigo, nombre, cliente_num, cliente_nombre, estado AS estado_db, ultimo_movimiento
+       FROM proyectos WHERE ambito <> 'personal' ORDER BY ultimo_movimiento DESC NULLS LAST LIMIT 200`)).rows;
     const pend = (await pool.query(
       `SELECT proyecto, COUNT(*)::int n FROM documentos WHERE proyecto <> '' AND estado NOT IN ('Entregado','Cancelado') GROUP BY proyecto`)).rows;
     const mapaPend = Object.fromEntries(pend.map(p => [p.proyecto, p.n]));
-    res.json({ proyectos: proys.map(p => ({ ...p, documentos_pendientes: mapaPend[p.codigo] || 0 })) });
+    let proyectos = proys.map(p => {
+      const documentos_pendientes = mapaPend[p.codigo] || 0;
+      const estado = documentos_pendientes > 0 ? 'Activo' : p.estado_db;
+      return { ...p, documentos_pendientes, estado,
+        inconsistente: documentos_pendientes > 0 && p.estado_db !== 'Activo' };
+    });
+    if (!todos) proyectos = proyectos.filter(p => p.estado === 'Activo');
+    res.json({ proyectos });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
