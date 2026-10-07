@@ -41,6 +41,7 @@ app.set('trust proxy', true);
 app.use(cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN.split(','), credentials: false }));
 app.use(express.json({ limit: '15mb' }));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 30 } });
+const LOGO_VADOCA = require('./assets/logo-vadoca.js'); // data: URI, para marca de agua en plantillas imprimibles
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const ahora = () => new Date().toISOString();
@@ -1270,13 +1271,19 @@ app.get('/api/presupuestos/:codigo/imprimir', auth(['admin']), async (req, res) 
 <title>Presupuesto N°${esc(cod)}</title>
 <style>
   @media print { @page { margin: 2cm; } }
-  body { font-family: 'Calibri', Arial, sans-serif; color: #1a1a1a; max-width: 850px; margin: 0 auto; padding: 24px; line-height: 1.45; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font-family: 'Calibri', Arial, sans-serif; color: #1a1a1a; max-width: 850px; margin: 0 auto; padding: 24px; line-height: 1.45; position: relative; }
+  .marca-agua { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 340px; opacity: 0.07; pointer-events: none; }
   h1 { font-size: 20px; border-bottom: 2px solid #333; padding-bottom: 8px; }
   h2 { font-size: 15px; margin-top: 28px; border-bottom: 1px solid #999; padding-bottom: 4px; }
   .meta { color: #555; margin-bottom: 20px; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-  th, td { border: 1px solid #ccc; padding: 6px 8px; font-size: 13px; text-align: left; }
+  th, td { border: 1px solid #ccc; padding: 6px 8px; font-size: 13px; text-align: center; }
+  td:first-child { text-align: left; }
+  th { background: #2E75B6; color: #fff; }
+  tbody td { background: #DAE9F7; }
   td.num, th.num { text-align: right; }
+  th.num { text-align: center; }
   .totales td { border: none; padding: 3px 8px; }
   .totales .label { text-align: right; font-weight: bold; }
   .totales .valor { text-align: right; width: 140px; }
@@ -1286,6 +1293,7 @@ app.get('/api/presupuestos/:codigo/imprimir', auth(['admin']), async (req, res) 
   p { margin: 6px 0; }
 </style>
 </head><body>
+  <img class="marca-agua" src="${LOGO_VADOCA}" alt="">
   <h1>Presupuesto N°${esc(cod)}</h1>
   <div class="meta">${esc(p.fecha_emision || '')} — ${esc(p.cliente_nombre || p.cliente_num || '')}<br>${esc(p.descripcion)}</div>
 
