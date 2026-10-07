@@ -786,27 +786,37 @@ app.get('/api/integracion/pendientes', auth(), async (req, res) => {
    viene tal proyecto" sin tener que pedir expediente por expediente. estado=todos trae
    también los cerrados (por defecto solo los que siguen con trabajo real).
 
-   OJO: la columna `estado` de la tabla puede quedar desincronizada de la realidad (un
-   proyecto marcado 'Cerrado' a mano que en los hechos todavía tiene documentos sin
-   entregar) — el panel web NO usa esa columna cruda para la etiqueta que le muestra a
-   Dami, la calcula según si quedan documentos pendientes. Acá hacemos lo mismo: un
-   proyecto con documentos_pendientes > 0 se considera activo pase lo que diga `estado`,
-   y la columna cruda se expone aparte (estado_db) solo como referencia/diagnóstico, para
-   poder detectar y flaggear esa desincronización en vez de repetirla. */
+   OJO: la columna `estado` de la tabla puede quedar desincronizada de la realidad, y el
+   panel web NO la usa tal cual para la etiqueta que le muestra a Dami. La regla real
+   (la misma que aplica el panel) es por COMPLETITUD de documentos, no por esa columna:
+   - Proyecto CON documentos vinculados ("con seguimiento"): Cerrado si no le queda
+     ningún documento pendiente, Activo si le queda al menos uno — pase lo que diga la
+     columna cruda.
+   - Proyecto SIN ningún documento vinculado ("sin seguimiento", ej. uno recién creado
+     o llevado aparte): no hay forma de calcularlo por completitud, así que ahí sí se
+     usa la columna cruda tal cual.
+   La columna cruda se expone aparte (estado_db) solo como referencia/diagnóstico, y
+   `inconsistente` marca cuando un proyecto CON seguimiento no coincide con su columna
+   cruda — para poder avisar de ese tipo de desincronización en vez de repetirla. */
 app.get('/api/integracion/proyectos', auth(), async (req, res) => {
   try {
     const todos = req.query.estado === 'todos';
     const proys = (await pool.query(
       `SELECT codigo, nombre, cliente_num, cliente_nombre, estado AS estado_db, ultimo_movimiento
        FROM proyectos WHERE ambito <> 'personal' ORDER BY ultimo_movimiento DESC NULLS LAST LIMIT 200`)).rows;
+    const totales = (await pool.query(
+      `SELECT proyecto, COUNT(*)::int n FROM documentos WHERE proyecto <> '' GROUP BY proyecto`)).rows;
     const pend = (await pool.query(
       `SELECT proyecto, COUNT(*)::int n FROM documentos WHERE proyecto <> '' AND estado NOT IN ('Entregado','Cancelado') GROUP BY proyecto`)).rows;
+    const mapaTotales = Object.fromEntries(totales.map(p => [p.proyecto, p.n]));
     const mapaPend = Object.fromEntries(pend.map(p => [p.proyecto, p.n]));
     let proyectos = proys.map(p => {
+      const documentos_totales = mapaTotales[p.codigo] || 0;
       const documentos_pendientes = mapaPend[p.codigo] || 0;
-      const estado = documentos_pendientes > 0 ? 'Activo' : p.estado_db;
+      const conSeguimiento = documentos_totales > 0;
+      const estado = conSeguimiento ? (documentos_pendientes > 0 ? 'Activo' : 'Cerrado') : p.estado_db;
       return { ...p, documentos_pendientes, estado,
-        inconsistente: documentos_pendientes > 0 && p.estado_db !== 'Activo' };
+        inconsistente: conSeguimiento && estado !== p.estado_db };
     });
     if (!todos) proyectos = proyectos.filter(p => p.estado === 'Activo');
     res.json({ proyectos });
