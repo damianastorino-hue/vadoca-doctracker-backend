@@ -1272,22 +1272,22 @@ app.get('/api/presupuestos/:codigo/imprimir', auth(['admin']), async (req, res) 
 <style>
   @media print { @page { margin: 2cm; } }
   * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  body { font-family: 'Calibri', Arial, sans-serif; color: #1a1a1a; max-width: 850px; margin: 0 auto; padding: 24px; line-height: 1.45; position: relative; }
+  body { font-family: 'Calibri', Arial, sans-serif; font-size: 11pt; color: #1a1a1a; max-width: 850px; margin: 0 auto; padding: 24px; line-height: 1.45; position: relative; }
   .marca-agua { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 340px; opacity: 0.07; pointer-events: none; }
-  h1 { font-size: 20px; border-bottom: 2px solid #333; padding-bottom: 8px; }
-  h2 { font-size: 15px; margin-top: 28px; border-bottom: 1px solid #999; padding-bottom: 4px; }
+  h1 { font-size: 20pt; border-bottom: 2px solid #333; padding-bottom: 8px; }
+  h2 { font-size: 14pt; margin-top: 28px; border-bottom: 1px solid #999; padding-bottom: 4px; color: #2E75B6; }
+  .subtitulo { font-size: 12pt; font-weight: bold; margin-top: 20px; margin-bottom: 4px; }
   .meta { color: #555; margin-bottom: 20px; }
   table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-  th, td { border: 1px solid #ccc; padding: 6px 8px; font-size: 13px; text-align: center; }
+  th, td { border: 1px solid #ccc; padding: 6px 8px; font-size: 11pt; text-align: center; }
   td:first-child { text-align: left; }
-  th { background: #2E75B6; color: #fff; }
-  tbody td { background: #DAE9F7; }
+  th { background: #DAE9F7; color: #1a1a1a; }
   td.num, th.num { text-align: right; }
   th.num { text-align: center; }
   .totales td { border: none; padding: 3px 8px; }
   .totales .label { text-align: right; font-weight: bold; }
   .totales .valor { text-align: right; width: 140px; }
-  .totales .total td { border-top: 2px solid #333; font-size: 15px; }
+  .totales .total td { border-top: 2px solid #333; font-size: 13pt; }
   .firma { margin-top: 60px; display: flex; justify-content: space-between; }
   .firma div { width: 45%; border-top: 1px solid #333; padding-top: 6px; text-align: center; color: #555; }
   p { margin: 6px 0; }
@@ -1310,7 +1310,7 @@ app.get('/api/presupuestos/:codigo/imprimir', auth(['admin']), async (req, res) 
     ${v.iva_discriminado && v.iva_monto !== null ? `<tr><td class="label">IVA</td><td class="valor">${fmt(v.iva_monto)}</td></tr>` : ''}
     <tr class="total"><td class="label">Total (${esc(v.moneda)})</td><td class="valor">${fmt(v.total)}</td></tr>
   </table>
-  ${v.forma_pago ? `<h2>Forma de pago</h2>${nl2p(v.forma_pago)}` : ''}
+  ${v.forma_pago ? `<p class="subtitulo">Forma de pago</p>${nl2p(v.forma_pago)}` : ''}
 
   ${v.condiciones ? `<h2>5. Condiciones y Aclaraciones</h2>${nl2p(v.condiciones)}` : ''}
 
