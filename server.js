@@ -41,6 +41,7 @@ app.set('trust proxy', true);
 app.use(cors({ origin: FRONTEND_ORIGIN === '*' ? true : FRONTEND_ORIGIN.split(','), credentials: false }));
 app.use(express.json({ limit: '15mb' }));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024, files: 30 } });
+const LOGO_VADOCA = require('./assets/logo-vadoca.js'); // data: URI, para marca de agua en plantillas imprimibles
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const ahora = () => new Date().toISOString();
@@ -134,6 +135,27 @@ CREATE TABLE IF NOT EXISTS proyectos (
   autor TEXT NOT NULL,
   ultimo_movimiento TIMESTAMPTZ,
   creado TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Versionado de presupuestos (v1): cada edición real = una fila nueva, snapshot completo.
+-- El código del header (presupuestos.codigo) nunca cambia; "v1/v2/v3" es solo este numero.
+-- Sin motor de descuentos ni catálogo de precios: los totales los carga quien prepara el
+-- presupuesto (igual que hoy en el Word), items es solo para mostrar el detalle.
+CREATE TABLE IF NOT EXISTS presupuesto_versiones (
+  id SERIAL PRIMARY KEY,
+  presupuesto_codigo TEXT NOT NULL REFERENCES presupuestos(codigo) ON DELETE CASCADE,
+  numero INT NOT NULL,
+  moneda TEXT NOT NULL DEFAULT 'ARS',
+  items JSONB NOT NULL DEFAULT '[]',   -- [{descripcion, cantidad?, precio_unitario?, importe?}, ...] todo opcional salvo descripcion
+  subtotal NUMERIC,
+  descuento_pct NUMERIC, descuento_monto NUMERIC,
+  iva_discriminado BOOLEAN NOT NULL DEFAULT false, iva_monto NUMERIC,
+  total NUMERIC NOT NULL,
+  alcance TEXT DEFAULT '', entregables TEXT DEFAULT '', cronograma TEXT DEFAULT '',
+  forma_pago TEXT DEFAULT '', condiciones TEXT DEFAULT '',
+  bloqueada BOOLEAN NOT NULL DEFAULT false,  -- true desde que el presupuesto se emite (estado <> Borrador)
+  autor TEXT NOT NULL,
+  creado TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(presupuesto_codigo, numero)
 );
 CREATE TABLE IF NOT EXISTS proyecto_presupuestos (
   id SERIAL PRIMARY KEY,
@@ -1147,9 +1169,157 @@ app.post('/api/presupuestos/:codigo/estado', auth(['admin']), async (req, res) =
     const { estado } = req.body || {};
     const r = await pool.query('UPDATE presupuestos SET estado=$1, ultimo_movimiento=now() WHERE codigo=$2 RETURNING codigo', [estado, req.params.codigo]);
     if (!r.rowCount) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+    // Al emitir (cualquier estado que no sea Borrador) la versión vigente queda bloqueada para
+    // siempre — si después hace falta cambiar algo, se crea una versión nueva, esta no se toca.
+    await pool.query(
+      `UPDATE presupuesto_versiones SET bloqueada=$1
+       WHERE presupuesto_codigo=$2 AND numero = (SELECT MAX(numero) FROM presupuesto_versiones WHERE presupuesto_codigo=$2)`,
+      [estado !== 'Borrador', req.params.codigo]);
     await agregarBitacora('PRES-' + req.params.codigo, req.user.email, 'estado', `Presupuesto ${req.params.codigo} → ${estado}`);
     programarEspejo();
     res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* ============================================================
+   VERSIONADO DE PRESUPUESTOS (v1)
+   ============================================================ */
+
+/* Lista resumida de versiones de un presupuesto (más reciente primero). */
+app.get('/api/presupuestos/:codigo/versiones', auth(['admin']), async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT numero, moneda, total, bloqueada, autor, creado FROM presupuesto_versiones
+       WHERE presupuesto_codigo=$1 ORDER BY numero DESC`, [req.params.codigo]);
+    res.json({ versiones: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* Detalle completo de una versión puntual (para ver histórico o armar la impresión). */
+app.get('/api/presupuestos/:codigo/versiones/:numero', auth(['admin']), async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT * FROM presupuesto_versiones WHERE presupuesto_codigo=$1 AND numero=$2',
+      [req.params.codigo, req.params.numero]);
+    if (!r.rowCount) return res.status(404).json({ error: 'Versión no encontrada' });
+    res.json(r.rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* Crea una versión nueva (snapshot completo). El código del header no cambia nunca.
+   Crear una versión siempre reabre el presupuesto a 'Borrador' — es una ronda nueva de
+   negociación/revisión; la versión anterior, si ya estaba emitida, queda intacta como
+   historial. Sin motor de descuentos: subtotal/descuento/total se cargan tal cual, no
+   se recalculan a partir de los ítems (los ítems son solo el detalle a mostrar). */
+app.post('/api/presupuestos/:codigo/versiones', auth(['admin']), async (req, res) => {
+  try {
+    const cod = req.params.codigo;
+    const p = (await pool.query('SELECT * FROM presupuestos WHERE codigo=$1', [cod])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+    const { items, moneda, subtotal, descuento_pct, descuento_monto, iva_discriminado, iva_monto,
+      total, alcance, entregables, cronograma, forma_pago, condiciones, motivo } = req.body || {};
+    if (total === undefined || total === null || total === '') return res.status(400).json({ error: 'Falta el total' });
+    let itemsArr = items;
+    if (typeof itemsArr === 'string') { try { itemsArr = JSON.parse(itemsArr); } catch { itemsArr = null; } }
+    if (itemsArr !== undefined && itemsArr !== null && !Array.isArray(itemsArr))
+      return res.status(400).json({ error: 'items debe ser un array (puede ir vacío)' });
+
+    const mon = moneda || p.moneda || 'ARS';
+    const numero = ((await pool.query('SELECT COALESCE(MAX(numero),0) mx FROM presupuesto_versiones WHERE presupuesto_codigo=$1', [cod])).rows[0].mx) + 1;
+
+    await pool.query(
+      `INSERT INTO presupuesto_versiones(presupuesto_codigo,numero,moneda,items,subtotal,descuento_pct,descuento_monto,iva_discriminado,iva_monto,total,alcance,entregables,cronograma,forma_pago,condiciones,autor)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+      [cod, numero, mon, JSON.stringify(itemsArr || []), subtotal ?? null, descuento_pct ?? null, descuento_monto ?? null,
+        !!iva_discriminado, iva_monto ?? null, total, alcance || '', entregables || '', cronograma || '', forma_pago || '', condiciones || '', req.user.email]);
+
+    // La versión nueva reabre el presupuesto a Borrador y sincroniza monto/moneda del header
+    // (de los que todavía dependen otras pantallas/reportes existentes).
+    await pool.query(`UPDATE presupuestos SET estado='Borrador', monto=$1, moneda=$2, ultimo_movimiento=now() WHERE codigo=$3`, [total, mon, cod]);
+    await agregarBitacora('PRES-' + cod, req.user.email, 'version',
+      `Versión ${numero} creada${motivo ? ' — ' + motivo.trim() : ''} (${mon} ${total}). Presupuesto vuelve a Borrador para revisión.`);
+    programarEspejo();
+    res.json({ ok: true, numero });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/* HTML listo para imprimir (Ctrl+P) de una versión — por defecto la más reciente.
+   v1: CSS de impresión nomás; PDF server-side queda para una iteración futura. */
+app.get('/api/presupuestos/:codigo/imprimir', auth(['admin']), async (req, res) => {
+  try {
+    const cod = req.params.codigo;
+    const p = (await pool.query('SELECT * FROM presupuestos WHERE codigo=$1', [cod])).rows[0];
+    if (!p) return res.status(404).json({ error: 'Presupuesto no encontrado' });
+    const v = req.query.version
+      ? (await pool.query('SELECT * FROM presupuesto_versiones WHERE presupuesto_codigo=$1 AND numero=$2', [cod, req.query.version])).rows[0]
+      : (await pool.query('SELECT * FROM presupuesto_versiones WHERE presupuesto_codigo=$1 ORDER BY numero DESC LIMIT 1', [cod])).rows[0];
+    if (!v) return res.status(404).json({ error: 'Este presupuesto todavía no tiene ninguna versión cargada' });
+
+    const esc = (s) => String(s ?? '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+    const nl2p = (s) => esc(s).split(/\n{2,}/).map(par => `<p>${par.replace(/\n/g, '<br>')}</p>`).join('\n');
+    const fmt = (n) => n === null || n === undefined ? '' : Number(n).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const items = Array.isArray(v.items) ? v.items : (typeof v.items === 'string' ? JSON.parse(v.items) : []);
+    const filasItems = items.map(it => `<tr>
+        <td>${esc(it.descripcion)}</td>
+        <td class="num">${it.cantidad ?? ''}</td>
+        <td class="num">${it.precio_unitario !== undefined && it.precio_unitario !== null ? fmt(it.precio_unitario) : ''}</td>
+        <td class="num">${it.importe !== undefined && it.importe !== null ? fmt(it.importe) : ''}</td>
+      </tr>`).join('\n');
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!doctype html><html lang="es"><head><meta charset="utf-8">
+<title>Presupuesto N°${esc(cod)}</title>
+<style>
+  @media print { @page { margin: 2cm; } }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { font-family: 'Calibri', Arial, sans-serif; font-size: 11pt; color: #1a1a1a; max-width: 850px; margin: 0 auto; padding: 24px; line-height: 1.45; position: relative; }
+  .marca-agua { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 340px; opacity: 0.07; pointer-events: none; }
+  h1 { font-size: 20pt; border-bottom: 2px solid #333; padding-bottom: 8px; }
+  h2 { font-size: 14pt; margin-top: 28px; border-bottom: 1px solid #999; padding-bottom: 4px; color: #2E75B6; }
+  .subtitulo { font-size: 12pt; font-weight: bold; margin-top: 20px; margin-bottom: 4px; }
+  .meta { color: #555; margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  th, td { border: 1px solid #ccc; padding: 6px 8px; font-size: 11pt; text-align: center; }
+  td:first-child { text-align: left; }
+  th { background: #DAE9F7; color: #1a1a1a; }
+  td.num, th.num { text-align: right; }
+  th.num { text-align: center; }
+  .totales td { border: none; padding: 3px 8px; }
+  .totales .label { text-align: right; font-weight: bold; }
+  .totales .valor { text-align: right; width: 140px; }
+  .totales .total td { border-top: 2px solid #333; font-size: 13pt; }
+  .firma { margin-top: 60px; display: flex; justify-content: space-between; }
+  .firma div { width: 45%; border-top: 1px solid #333; padding-top: 6px; text-align: center; color: #555; }
+  p { margin: 6px 0; }
+</style>
+</head><body>
+  <img class="marca-agua" src="${LOGO_VADOCA}" alt="">
+  <h1>Presupuesto N°${esc(cod)}</h1>
+  <div class="meta">${esc(p.fecha_emision || '')} — ${esc(p.cliente_nombre || p.cliente_num || '')}<br>${esc(p.descripcion)}</div>
+
+  ${v.alcance ? `<h2>1. Alcance del Proyecto</h2>${nl2p(v.alcance)}` : ''}
+  ${v.entregables ? `<h2>2. Entregables Técnicos</h2>${nl2p(v.entregables)}` : ''}
+  ${v.cronograma ? `<h2>3. Cronograma de Entregas</h2>${nl2p(v.cronograma)}` : ''}
+
+  <h2>4. Condiciones Comerciales</h2>
+  ${items.length ? `<table><thead><tr><th>Descripción</th><th class="num">Cant.</th><th class="num">P. Unit.</th><th class="num">Importe</th></tr></thead>
+  <tbody>${filasItems}</tbody></table>` : ''}
+  <table class="totales">
+    ${v.subtotal !== null ? `<tr><td class="label">Subtotal (${esc(v.moneda)})</td><td class="valor">${fmt(v.subtotal)}</td></tr>` : ''}
+    ${v.descuento_monto !== null ? `<tr><td class="label">Descuento${v.descuento_pct ? ' (' + v.descuento_pct + '%)' : ''}</td><td class="valor">-${fmt(v.descuento_monto)}</td></tr>` : ''}
+    ${v.iva_discriminado && v.iva_monto !== null ? `<tr><td class="label">IVA</td><td class="valor">${fmt(v.iva_monto)}</td></tr>` : ''}
+    <tr class="total"><td class="label">Total (${esc(v.moneda)})</td><td class="valor">${fmt(v.total)}</td></tr>
+  </table>
+  ${v.forma_pago ? `<p class="subtitulo">Forma de pago</p>${nl2p(v.forma_pago)}` : ''}
+
+  ${v.condiciones ? `<h2>5. Condiciones y Aclaraciones</h2>${nl2p(v.condiciones)}` : ''}
+
+  <h2>6. Aceptación de la Propuesta</h2>
+  <div class="firma">
+    <div>Nombre y Cargo del Cliente</div>
+    <div>Firma y Fecha</div>
+  </div>
+</body></html>`);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post('/api/presupuestos/:codigo/notas', auth(['admin']), upload.array('archivos', 30), async (req, res) => {
